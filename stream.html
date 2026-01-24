@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Stream | RIZE</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <link rel="icon" type="image/svg+xml" href="icons/logo.png">
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/streaming-analytics.css">
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+    <nav>
+        <a class="logo" href="index.html">
+            <div class="logo-img">
+                <img src="icons/logo.png" alt="RIZE - Logo" />
+            </div>
+            <span>RIZE</span>
+        </a>
+        <div class="nav-links">
+            <a href="index.html#discover">Découvrir</a>
+            <a href="index.html#profile" id="nav-profile">Ma Trajectoire</a>
+            <a href="login.html" id="nav-auth">Connexion</a>
+        </div>
+    </nav>
+
+    <div class="stream-container">
+        <div class="stream-main">
+            <div class="stream-video-container">
+                <video id="stream-video" class="stream-video" autoplay playsinline></video>
+                <div class="stream-overlay">
+                    <div id="stream-status" class="stream-status live">
+                        🔴 EN DIRECT
+                    </div>
+                    <div class="stream-viewers">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                        <span id="stream-viewer-count">0</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stream-info">
+                <h1 id="stream-title" class="stream-title">Titre du Stream</h1>
+                <p id="stream-description" class="stream-description">Description du stream...</p>
+                
+                <div class="stream-host">
+                    <img id="stream-host-avatar" src="" class="stream-host-avatar" alt="Host">
+                    <div class="stream-host-info">
+                        <h4 id="stream-host-name">Nom de l'hôte</h4>
+                        <p>Streamer</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="stream-chat">
+            <div class="stream-chat-header">
+                Chat en direct
+            </div>
+            <div id="stream-chat-messages" class="stream-chat-messages">
+                <!-- Messages injectés dynamiquement -->
+            </div>
+            <form id="stream-chat-form" class="stream-chat-form">
+                <input 
+                    type="text" 
+                    id="stream-chat-input" 
+                    class="stream-chat-input" 
+                    placeholder="Envoyer un message..."
+                    maxlength="500"
+                    required
+                />
+                <button type="submit" class="stream-chat-send">Envoyer</button>
+            </form>
+        </div>
+    </div>
+
+    <script src="js/supabase-config.js"></script>
+    <script src="js/streaming.js"></script>
+    <script>
+        // Récupérer l'ID du stream depuis l'URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const streamId = urlParams.get('id');
+        
+        if (!streamId) {
+            alert('ID de stream manquant');
+            window.location.href = 'index.html';
+        } else {
+            // Initialiser la page de stream
+            document.addEventListener('DOMContentLoaded', async () => {
+                await checkAuth();
+                if (!currentUser) {
+                    window.location.href = 'login.html';
+                    return;
+                }
+                
+                await initializeStreamPage(streamId);
+            });
+        }
+        
+        // Nettoyer lors de la fermeture
+        window.addEventListener('beforeunload', () => {
+            leaveStream();
+        });
+    </script>
+</body>
+</html>

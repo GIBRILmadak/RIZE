@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RIZE | Connexion</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <link rel="icon" type="image/svg+xml" href="icons/logo.png">
+    <link rel="shortcut icon" href="icons/logo.png">
+    <meta name="theme-color" content="#050505">
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/login.css">
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body class="login-body">
+    <div class="login-container">
+        <div class="login-left">
+            <div class="login-hero">
+                <div class="login-logo">
+                    <img src="icons/logo.png" alt="RIZE Logo" />
+                </div>
+                <h1>Documentez l'effort.</h1>
+                <p>Rejoignez une communauté de builders qui partagent leur progression authentique, sans filtres.</p>
+                <div class="login-features">
+                    <div class="feature-item">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                            <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                        </svg>
+                        <span>Progression transparente</span>
+                    </div>
+                    <div class="feature-item">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="9" cy="7" r="4"></circle>
+                            <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                            <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                        </svg>
+                        <span>Communauté authentique</span>
+                    </div>
+                    <div class="feature-item">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                        </svg>
+                        <span>Suivi jour par jour</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="login-right">
+            <div class="login-form-container">
+                <div class="login-form-header">
+                    <h2 id="form-title">Bienvenue sur RIZE</h2>
+                    <p id="form-subtitle">Connectez-vous pour continuer</p>
+                </div>
+                
+                <div id="error-message" class="error-message" style="display: none;"></div>
+                <div id="success-message" class="success-message" style="display: none;"></div>
+                
+                <form id="auth-form" class="login-form">
+                    <div class="form-group" id="username-group" style="display: none;">
+                        <label for="username">Nom d'utilisateur</label>
+                        <input type="text" id="username" class="form-input" placeholder="Votre nom d'utilisateur" />
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" class="form-input" placeholder="votre@email.com" required />
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="password">Mot de passe</label>
+                        <input type="password" id="password" class="form-input" placeholder="••••••••" required />
+                    </div>
+                    
+                    <div class="form-group" id="confirm-password-group" style="display: none;">
+                        <label for="confirm-password">Confirmer le mot de passe</label>
+                        <input type="password" id="confirm-password" class="form-input" placeholder="••••••••" />
+                    </div>
+                    
+                    <button type="submit" class="btn-submit" id="submit-btn">
+                        <span id="btn-text">Se connecter</span>
+                        <svg id="btn-loader" class="btn-loader" style="display: none;" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"></circle>
+                        </svg>
+                    </button>
+                </form>
+                
+                <div class="login-divider">
+                    <span>ou</span>
+                </div>
+                
+                <div class="login-toggle">
+                    <p id="toggle-text">Pas encore de compte ?</p>
+                    <a href="#" id="toggle-link">Créer un compte</a>
+                </div>
+                
+                <div class="login-footer">
+                    <a href="index.html">← Retour à l'accueil</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="js/supabase-config.js"></script>
+    <script src="js/login.js"></script>
+</body>
+</html>
