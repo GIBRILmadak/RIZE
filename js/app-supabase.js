@@ -1,0 +1,5199 @@
+/* ========================================
+   APP.JS - VERSION SUPABASE INTÉGRÉE
+   Remplace les données mockées par des appels API réels
+   ======================================== */
+
+// État global de l'application
+window.currentUser = null;
+window.currentUserId = null;
+window.currentViewerId = null;
+window.allUsers = [];
+window.userContents = {};
+window.userProjects = {};
+window.adminAnnouncements = [];
+window.hasLoadedUsers = false;
+window.userLoadError = null;
+
+function isMobileDevice() {
+    return window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
+}
+
+/* ========================================
+   INITIALISATION ET AUTHENTIFICATION
+   ======================================== */
+
+// Vérifier l'authentification au chargement
+async function initializeApp() {
+    const grid = document.querySelector('.discover-grid');
+    const waitMessage = document.querySelector('.wait');
+
+    // Timeout de sécurité : si rien ne se passe après 1 minute
+    const safetyTimeout = setTimeout(() => {
+        if (document.querySelector('.loading-state-container')) {
+            console.warn('Initialization timed out');
+            if (grid) LoadingStateManager.showEmptyState(
+                grid, 
+                '⚠️', 
+                'Délai dépassé', 
+                'Le serveur met trop de temps à répondre.',
+                { text: 'Réessayer', action: 'location.reload()' }
+            );
+            if (waitMessage) waitMessage.classList.add('is-hidden');
+        }
+    }, 60000);
+
+    try {
+        if (grid && window.LoadingStateManager && typeof LoadingStateManager.showSpinner === 'function') {
+            LoadingStateManager.showSpinner(grid);
+        }
+
+        // Vérifier si Supabase est chargé
+        if (typeof supabase === 'undefined' || !supabase) {
+            window.userLoadError = 'Supabase client introuvable';
+            window.hasLoadedUsers = true;
+            await renderDiscoverGrid();
+            if (waitMessage) waitMessage.classList.add('is-hidden');
+            clearTimeout(safetyTimeout);
+            return;
+        }
+
+        const skipLanding = isMobileDevice();
+        const savedSession = typeof SessionManager !== 'undefined'
+            ? SessionManager.loadSession()
+            : null;
+        
+        // Vérifier la session avec Supabase
+        const user = await checkAuth();
+        
+        if (user) {
+            window.currentUser = user;
+            window.currentUserId = user.id;
+            window.currentViewerId = user.id;
+            if (typeof SessionManager !== 'undefined') {
+                SessionManager.saveSession(user);
+            }
+            updateNavigation(true);
+            navigateTo('discover');
+            await loadAllData();
+        } else if (savedSession) {
+            if (typeof ToastManager !== 'undefined') {
+                ToastManager.info('Session expirée', 'Veuillez vous reconnecter');
+            }
+            if (typeof SessionManager !== 'undefined') {
+                SessionManager.clearSession();
+            }
+            updateNavigation(false);
+            await loadPublicData();
+        } else {
+            updateNavigation(false);
+            await loadPublicData();
+        }
+
+        if (skipLanding) {
+            navigateTo('discover');
+        }
+        
+        initTheme();
+        subscribeToRealtime();
+        
+        await renderDiscoverGrid();
+        
+        if (window.currentUserId) {
+            await renderProfileIntoContainer(window.currentUserId);
+        }
+
+        clearTimeout(safetyTimeout);
+
+    } catch (error) {
+        console.error('Initialization error:', error);
+        clearTimeout(safetyTimeout);
+        window.userLoadError = error?.message || 'Erreur de chargement';
+        window.hasLoadedUsers = true;
+        await renderDiscoverGrid();
+        if (waitMessage) waitMessage.classList.add('is-hidden');
+    }
+}
+
+// Mettre à jour la navigation selon l'état de connexion
+function updateNavigation(isLoggedIn) {
+    const navAuth = document.getElementById('nav-auth');
+    const navProfile = document.getElementById('nav-profile');
+    
+    if (navAuth) {
+        if (isLoggedIn) {
+            navAuth.style.display = 'none';
+        } else {
+            navAuth.style.display = 'block';
+            navAuth.textContent = 'Connexion';
+            navAuth.onclick = () => window.location.href = 'login.html';
+        }
+    }
+    
+    if (navProfile) {
+        if (!isLoggedIn) {
+            navProfile.style.display = 'none';
+        } else {
+            navProfile.style.display = 'block';
+        }
+    }
+}
+
+// Gérer la déconnexion
+async function handleSignOut() {
+    const result = await signOut();
+    if (result.success) {
+        SessionManager.clearSession();
+        ToastManager.success('Déconnexion', 'À bientôt !');
+        setTimeout(() => {
+            window.location.href = 'login.html';
+        }, 1500);
+    }
+}
+
+/* ========================================
+   GESTION DU PROFIL UTILISATEUR
+   ======================================== */
+
+// S'assurer qu'un utilisateur a un profil valide
+async function ensureUserProfile(user) {
+    try {
+        // Vérifier si le profil existe
+        const profileResult = await getUserProfile(user.id);
+        
+        if (!profileResult.success) {
+            // Créer un nouveau profil
+            const username = user.user_metadata?.username || user.email.split('@')[0];
+            const accountType = user.user_metadata?.account_type || null;
+            const accountSubtype = user.user_metadata?.account_subtype || null;
+            const badge = user.user_metadata?.badge || null;
+
+            const profileData = {
+                name: username,
+                title: accountSubtype || 'Nouveau membre',
+                bio: '',
+                avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${user.id}`,
+                banner: 'https://placehold.co/1200x300/1a1a2e/00ff88?text=Ma+Trajectoire',
+                account_type: accountType,
+                account_subtype: accountSubtype,
+                badge: badge,
+                socialLinks: {}
+            };
+            
+            const createResult = await upsertUserProfile(user.id, profileData);
+            
+            if (createResult.success) {
+                console.log('Profil utilisateur créé avec succès');
+                return createResult.data;
+            } else {
+                console.error('Erreur création profil:', createResult.error);
+                return null;
+            }
+        } else {
+            console.log('Profil utilisateur trouvé');
+            return profileResult.data;
+        }
+    } catch (error) {
+        console.error('Erreur ensureUserProfile:', error);
+        return null;
+    }
+}
+
+/* ========================================
+   CHARGEMENT DES DONNÉES
+   ======================================== */
+
+// Charger toutes les données pour un utilisateur connecté
+async function loadAllData() {
+    try {
+        window.hasLoadedUsers = false;
+        window.userLoadError = null;
+        // S'assurer que l'utilisateur connecté a un profil
+        if (window.currentUser) {
+            await ensureUserProfile(window.currentUser);
+        }
+        
+        // Charger tous les utilisateurs
+        const usersResult = await getAllUsers();
+        if (usersResult.success) {
+            allUsers = usersResult.data;
+            
+            // S'assurer que l'utilisateur connecté est dans la liste
+            if (window.currentUser && !allUsers.find(u => u.id === window.currentUser.id)) {
+                // Recharger le profil de l'utilisateur connecté
+                const userProfileResult = await getUserProfile(window.currentUser.id);
+                if (userProfileResult.success) {
+                    allUsers.push(userProfileResult.data);
+                }
+            }
+            window.hasLoadedUsers = true;
+        } else {
+            window.userLoadError = usersResult.error || 'Erreur de chargement des utilisateurs';
+            window.hasLoadedUsers = true;
+        }
+
+        computeAmbassadors();
+        await fetchVerifiedBadges();
+        await fetchAdminAnnouncements();
+        
+        // Charger le contenu pour chaque utilisateur
+        for (const user of allUsers) {
+            const contentResult = await getUserContent(user.id);
+            if (contentResult.success) {
+                userContents[user.id] = contentResult.data.map(convertSupabaseContent);
+            }
+            
+            const projectsResult = await getUserProjects(user.id);
+            if (projectsResult.success) {
+                userProjects[user.id] = projectsResult.data;
+            }
+        }
+    } catch (error) {
+        console.error('Erreur chargement données:', error);
+        window.userLoadError = error.message || 'Erreur de chargement des données';
+        window.hasLoadedUsers = true;
+    }
+}
+
+// Charger uniquement les données publiques
+async function loadPublicData() {
+    try {
+        window.hasLoadedUsers = false;
+        window.userLoadError = null;
+        const usersResult = await getAllUsers();
+        if (usersResult.success) {
+            allUsers = usersResult.data;
+            window.hasLoadedUsers = true;
+        } else {
+            window.userLoadError = usersResult.error || 'Erreur de chargement des utilisateurs';
+            window.hasLoadedUsers = true;
+        }
+
+        computeAmbassadors();
+        await fetchVerifiedBadges();
+        await fetchAdminAnnouncements();
+        
+        // Charger le contenu public
+        for (const user of allUsers) {
+            const contentResult = await getUserContentPublic(user.id);
+            if (contentResult.success) {
+                userContents[user.id] = contentResult.data.map(convertSupabaseContent);
+            }
+        }
+    } catch (error) {
+        console.error('Erreur chargement données publiques:', error);
+        window.userLoadError = error.message || 'Erreur de chargement des données';
+        window.hasLoadedUsers = true;
+    }
+}
+
+/* ========================================
+   FONCTIONS UTILITAIRES
+   ======================================== */
+
+// Récupérer un utilisateur par ID
+function getUser(userId) {
+    return allUsers.find(u => u.id === userId);
+}
+
+// Récupérer le contenu d'un utilisateur
+function getUserContentLocal(userId) {
+    const contents = userContents[userId] || [];
+    const visibleContents = isSuperAdmin()
+        ? contents
+        : contents.filter(c => !c.isDeleted);
+    // Sort by createdAt descending (newest first) instead of day_number
+    // This ensures cards show the actual latest upload
+    return visibleContents.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+// Récupérer le dernier contenu
+function getLatestContent(userId) {
+    const contents = getUserContentLocal(userId);
+    return contents.length > 0 ? contents[0] : null;
+}
+
+// Récupérer l'état dominant
+function getDominantState(userId) {
+    const contents = getUserContentLocal(userId);
+    if (contents.length === 0) return 'empty';
+    return contents[0].state;
+}
+
+// Formater le temps écoulé (il y a X temps)
+function timeAgo(date) {
+    if (!date) return '';
+    
+    const now = new Date();
+    const past = new Date(date);
+    const diffInSeconds = Math.floor((now - past) / 1000);
+    
+    if (diffInSeconds < 60) {
+        return "à l'instant";
+    }
+    
+    const diffInMinutes = Math.floor(diffInSeconds / 60);
+    if (diffInMinutes < 60) {
+        return `il y a ${diffInMinutes} min`;
+    }
+    
+    const diffInHours = Math.floor(diffInMinutes / 60);
+    if (diffInHours < 24) {
+        return `il y a ${diffInHours}h`;
+    }
+    
+    const diffInDays = Math.floor(diffInHours / 24);
+    if (diffInDays < 7) {
+        return `il y a ${diffInDays}j`;
+    }
+    
+    return new Intl.DateTimeFormat('fr-FR', { day: 'numeric', month: 'short' }).format(past);
+}
+
+// Convertir les données Supabase en format compatible avec le code existant
+function convertSupabaseUser(supabaseUser) {
+    return {
+        userId: supabaseUser.id,
+        name: supabaseUser.name,
+        title: supabaseUser.title || '',
+        avatar: supabaseUser.avatar,
+        banner: supabaseUser.banner,
+        bio: supabaseUser.bio || '',
+        socialLinks: supabaseUser.social_links || {},
+        projects: userProjects[supabaseUser.id] || []
+    };
+}
+
+function convertSupabaseContent(supabaseContent) {
+    return {
+        contentId: supabaseContent.id,
+        userId: supabaseContent.user_id,
+        projectId: supabaseContent.project_id,
+        arcId: supabaseContent.arc_id,
+        dayNumber: supabaseContent.day_number,
+        type: supabaseContent.type,
+        state: supabaseContent.state,
+        title: supabaseContent.title,
+        description: supabaseContent.description,
+        mediaUrl: supabaseContent.media_url,
+        views: supabaseContent.views || 0,
+        encouragementsCount: supabaseContent.encouragements_count || 0,
+        createdAt: new Date(supabaseContent.created_at),
+        isDeleted: !!supabaseContent.is_deleted,
+        deletedAt: supabaseContent.deleted_at ? new Date(supabaseContent.deleted_at) : null,
+        deletedReason: supabaseContent.deleted_reason || '',
+        arc: supabaseContent.arcs ? {
+            id: supabaseContent.arcs.id,
+            title: supabaseContent.arcs.title,
+            status: supabaseContent.arcs.status
+        } : null,
+        project: supabaseContent.projects ? {
+            id: supabaseContent.projects.id,
+            name: supabaseContent.projects.name
+        } : null
+    };
+}
+
+/* ========================================
+   SYSTÈME DE FOLLOWERS (SUPABASE)
+   ======================================== */
+
+async function toggleFollow(viewerId, targetUserId) {
+    if (!window.currentUser) {
+        ToastManager.info('Connexion requise', 'Vous devez être connecté pour suivre des utilisateurs');
+        setTimeout(() => window.location.href = 'login.html', 1500);
+        return;
+    }
+
+    const profile = getCurrentUserProfile();
+    if (isUserBanned(profile)) {
+        const remaining = getBanRemainingLabel(profile);
+        ToastManager.error('Compte temporairement banni', remaining ? `Vous pourrez réessayer dans ${remaining}.` : 'Vous ne pouvez pas suivre des utilisateurs pour le moment.');
+        return;
+    }
+    
+    const profileBtn = document.getElementById(`follow-btn-${targetUserId}`);
+    const cardBtn = document.getElementById(`follow-card-btn-${targetUserId}`);
+    const immersiveBtn = document.getElementById(`follow-immersive-btn-${targetUserId}`);
+    const immersivePostBtns = document.querySelectorAll(`[data-follow-user="${targetUserId}"]`);
+    
+    // Use the button that triggered the action for loading state, or profile button as default
+    const activeBtn = document.activeElement && (document.activeElement === profileBtn || document.activeElement === cardBtn || document.activeElement === immersiveBtn) 
+        ? document.activeElement 
+        : (profileBtn || cardBtn || immersiveBtn);
+
+    await LoadingManager.withLoading(activeBtn, async () => {
+        const isCurrentlyFollowing = await isFollowing(viewerId, targetUserId);
+        const followResult = isCurrentlyFollowing
+            ? await unfollowUser(viewerId, targetUserId)
+            : await followUser(viewerId, targetUserId);
+        
+        if (!followResult || !followResult.success) {
+            ToastManager.error('Erreur', followResult?.error || "Impossible de mettre a jour l'abonnement");
+            return;
+        }
+        
+        const isNowFollowing = !isCurrentlyFollowing;
+        
+        // Update Profile Button
+        if (profileBtn) {
+            profileBtn.classList.toggle('unfollow', isNowFollowing);
+            profileBtn.innerHTML = `<img src="${isNowFollowing ? 'icons/subscribed.svg' : 'icons/subscribe.svg'}" class="btn-icon" style="width: 24px; height: 24px;">`;
+        }
+
+        // Update Card Button
+        if (cardBtn) {
+            cardBtn.classList.toggle('unfollow', isNowFollowing);
+            cardBtn.title = isNowFollowing ? 'Se désabonner' : 'S\'abonner';
+            // Reset styles that might have been inline
+            cardBtn.style.background = 'transparent';
+            cardBtn.style.border = 'none';
+            cardBtn.innerHTML = `<img src="${isNowFollowing ? 'icons/subscribed.svg' : 'icons/subscribe.svg'}" class="btn-icon" style="width: 24px; height: 24px;">`;
+        }
+
+        // Update Immersive Button
+        if (immersiveBtn) {
+            immersiveBtn.classList.toggle('unfollow', isNowFollowing);
+            immersiveBtn.innerHTML = `<img src="${isNowFollowing ? 'icons/subscribed.svg' : 'icons/subscribe.svg'}" class="btn-icon" style="width: 24px; height: 24px;">`;
+        }
+
+        if (immersivePostBtns && immersivePostBtns.length > 0) {
+            immersivePostBtns.forEach(btn => {
+                btn.classList.toggle('unfollow', isNowFollowing);
+                btn.innerHTML = `<img src="${isNowFollowing ? 'icons/subscribed.svg' : 'icons/subscribe.svg'}" class="btn-icon" style="width: 20px; height: 20px;">`;
+            });
+        }
+        
+        // Toast notification
+        if (isNowFollowing) {
+            ToastManager.success('Abonnement confirmé', 'Vous suivez maintenant cet utilisateur');
+            if (profileBtn) AnimationManager.bounceIn(profileBtn);
+            if (cardBtn) AnimationManager.bounceIn(cardBtn);
+            if (immersiveBtn) AnimationManager.bounceIn(immersiveBtn);
+        } else {
+            ToastManager.info('Désabonnement', 'Vous ne suivez plus cet utilisateur');
+        }
+
+        
+        // Update follower counts
+        if (window.currentProfileViewed === targetUserId) {
+            const followerCount = await getFollowerCount(targetUserId);
+            const followerStats = document.querySelectorAll('.follower-stat-count');
+            if (followerStats[0]) {
+                followerStats[0].textContent = followerCount;
+            } else if (followerStats.length > 0) {
+                followerStats.forEach(stat => stat.textContent = followerCount);
+            }
+        }
+        
+        if (window.currentProfileViewed === viewerId) {
+            const followingCount = await getFollowingCount(viewerId);
+            const followerStats = document.querySelectorAll('.follower-stat-count');
+            if (followerStats[1]) {
+                followerStats[1].textContent = followingCount;
+            }
+        }
+
+        // If we are in "Following" filter mode on Discover, we might need to remove the card if we unfollowed
+        if (window.discoverFilter === 'following' && !isNowFollowing && cardBtn) {
+            const card = cardBtn.closest('.user-card');
+            if (card) {
+                card.style.opacity = '0';
+                setTimeout(() => {
+                    card.remove();
+                    // Check if grid is empty
+                    if (document.querySelectorAll('.user-card').length === 0) {
+                        renderDiscoverGrid(); // Will show empty state
+                    }
+                }, 300);
+            }
+        }
+    });
+}
+
+/* ========================================
+   INTERACTIONS (VUES & ENCOURAGEMENTS)
+   ======================================== */
+
+async function incrementViews(contentId) {
+    try {
+        await supabase.rpc('increment_views', { row_id: contentId });
+    } catch (error) {
+        console.error('Erreur incrementViews:', error);
+    }
+}
+
+async function toggleCourage(contentId, btnElement) {
+    if (!currentUser) {
+        ToastManager.info('Connexion requise', 'Connectez-vous pour encourager');
+        return;
+    }
+
+    // Determine intended state based on the clicked button
+    const isCurrentlyEncouraged = btnElement.classList.contains('encouraged');
+    const willBeEncouraged = !isCurrentlyEncouraged;
+
+    // Find ALL buttons for this content (in grid cards AND immersive view)
+    // We look for buttons that call toggleCourage with this contentId.
+    // Since we can't easily query by onclick handler, we'll assume we can select them if we add a data attribute
+    // or we can select all .courage-btn and check.
+    // Better: let's update the buttons to include data-content-id attribute in render functions first? 
+    // Or just query selector that matches the structure.
+    
+    // For now, let's select all buttons and filter, or assume the clicked one is the source of truth for optimistic UI
+    // and then update others.
+    
+    // To make this efficient, let's rely on the passed button for initial state, and then try to find others.
+    // In renderUserCard and renderImmersiveContent, I should add data-content-id to the button.
+    
+    // Let's assume we update renderUserCard and renderImmersiveContent to add data-content-id="${contentId}" to the button.
+    // But I haven't done that yet.
+    
+    // So, let's update the clicked button first (Optimistic)
+    const updateButtonUI = (btn, encouraged, count) => {
+        const img = btn.querySelector('img');
+        const countSpan = btn.querySelector('.courage-count');
+        
+        if (encouraged) {
+            btn.classList.add('encouraged');
+            img.src = 'icons/courage-green.svg';
+            AnimationManager.bounceIn(img);
+        } else {
+            btn.classList.remove('encouraged');
+            img.src = 'icons/courage-blue.svg';
+        }
+        if (countSpan) countSpan.textContent = count;
+    };
+
+    // Calculate new count
+    const countSpan = btnElement.querySelector('.courage-count');
+    let currentCount = parseInt(countSpan.textContent) || 0;
+    let newCount = willBeEncouraged ? currentCount + 1 : Math.max(0, currentCount - 1);
+
+    // Update the clicked button immediately
+    updateButtonUI(btnElement, willBeEncouraged, newCount);
+
+    // Try to update other buttons for the same content if we can find them
+    // (This is a bit hacky without a specific selector, but workable)
+    const allCourageButtons = document.querySelectorAll(`.courage-btn[data-content-id="${contentId}"], .courage-btn`);
+    allCourageButtons.forEach(btn => {
+        if (btn === btnElement) return; // already updated
+        // Check if this button belongs to the same content.
+        // In immersive view: parent .immersive-post has data-content-id
+        // In card view: card has data-user, but we need to know if it's the latest content.
+        
+        // Let's try to match by onclick attribute if possible, or better yet, add data-content-id to buttons in the future.
+        // For now, let's rely on the fact that the onclick string contains the ID.
+        const dataId = btn.getAttribute('data-content-id');
+        const onclickStr = btn.getAttribute('onclick');
+        if (dataId === String(contentId) || (onclickStr && onclickStr.includes(`'${contentId}'`))) {
+            updateButtonUI(btn, willBeEncouraged, newCount);
+        }
+    });
+
+    try {
+        const { data, error } = await supabase.rpc('toggle_courage', { 
+            row_id: contentId, 
+            user_id_param: currentUser.id 
+        });
+
+        if (error) throw error;
+
+        // Sync with server truth
+        if (data) {
+            allCourageButtons.forEach(btn => {
+                const dataId = btn.getAttribute('data-content-id');
+                const onclickStr = btn.getAttribute('onclick');
+                if (dataId === String(contentId) || (onclickStr && onclickStr.includes(`'${contentId}'`))) {
+                    updateButtonUI(btn, data.encouraged, data.count);
+                }
+            });
+        }
+        if (willBeEncouraged) {
+            const content = findContentById(contentId);
+            updateImmersivePrefs(content, 'like');
+        }
+    } catch (error) {
+        console.error('Erreur toggleCourage:', error);
+        // Revert on error
+        const revertEncouraged = isCurrentlyEncouraged; // Back to original
+        const revertCount = currentCount; // Back to original
+
+        allCourageButtons.forEach(btn => {
+            const dataId = btn.getAttribute('data-content-id');
+            const onclickStr = btn.getAttribute('onclick');
+            if (dataId === String(contentId) || (onclickStr && onclickStr.includes(`'${contentId}'`))) {
+                updateButtonUI(btn, revertEncouraged, revertCount);
+            }
+        });
+        
+        ToastManager.error('Erreur', 'Impossible de mettre à jour l\'encouragement');
+    }
+}
+
+
+/* ========================================
+   SYSTÈME DE BADGES (CONSERVÉ)
+   ======================================== */
+
+const AMBASSADOR_LIMIT = 150;
+const BADGE_ASSET_VERSION = '2';
+let ambassadorUserIds = new Set();
+
+const SUPER_ADMIN_ID = 'b0f9f893-1706-4721-899c-d26ad79afc86';
+const VERIFICATION_ADMIN_IDS = new Set([
+    SUPER_ADMIN_ID
+]);
+
+let verifiedCreatorUserIds = new Set();
+let verifiedStaffUserIds = new Set();
+let verificationRequests = [];
+
+function isSuperAdmin() {
+    return !!window.currentUser && window.currentUser.id === SUPER_ADMIN_ID;
+}
+
+function getCurrentUserProfile() {
+    if (!window.currentUser) return null;
+    return (window.allUsers || []).find(u => u.id === window.currentUser.id) || null;
+}
+
+function isUserBanned(userProfile) {
+    if (!userProfile || !userProfile.banned_until) return false;
+    const now = new Date();
+    const bannedUntil = new Date(userProfile.banned_until);
+    return bannedUntil > now;
+}
+
+function getBanRemainingLabel(userProfile) {
+    if (!userProfile || !userProfile.banned_until) return '';
+    const now = new Date();
+    const bannedUntil = new Date(userProfile.banned_until);
+    const diffMs = bannedUntil - now;
+    if (diffMs <= 0) return '';
+    const diffMinutes = Math.ceil(diffMs / (1000 * 60));
+    if (diffMinutes < 60) return `${diffMinutes} min`;
+    const diffHours = Math.ceil(diffMinutes / 60);
+    if (diffHours < 48) return `${diffHours} h`;
+    const diffDays = Math.ceil(diffHours / 24);
+    return `${diffDays} j`;
+}
+
+function computeAmbassadors() {
+    if (!Array.isArray(allUsers) || allUsers.length === 0) {
+        ambassadorUserIds = new Set();
+        return;
+    }
+
+    const sortedByCreation = [...allUsers]
+        .filter(user => user && user.created_at)
+        .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+    ambassadorUserIds = new Set(sortedByCreation.slice(0, AMBASSADOR_LIMIT).map(user => user.id));
+}
+
+async function fetchVerifiedBadges() {
+    try {
+        const { data, error } = await supabase
+            .from('verified_badges')
+            .select('user_id, type');
+
+        if (error) throw error;
+
+        const creators = new Set();
+        const staff = new Set();
+        (data || []).forEach(item => {
+            if (item.type === 'staff') staff.add(item.user_id);
+            if (item.type === 'creator') creators.add(item.user_id);
+        });
+
+        verifiedCreatorUserIds = creators;
+        verifiedStaffUserIds = staff;
+
+        // Fallback local: le super admin est toujours staff vérifié côté UI
+        if (SUPER_ADMIN_ID) {
+            verifiedStaffUserIds.add(SUPER_ADMIN_ID);
+        }
+    } catch (error) {
+        console.error('Erreur récupération badges vérifiés:', error);
+        verifiedCreatorUserIds = new Set();
+        verifiedStaffUserIds = new Set();
+        if (SUPER_ADMIN_ID) {
+            verifiedStaffUserIds.add(SUPER_ADMIN_ID);
+        }
+    }
+}
+
+function escapeHtml(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+async function fetchAdminAnnouncements() {
+    try {
+        const { data, error } = await supabase
+            .from('admin_announcements')
+            .select('*')
+            .is('deleted_at', null)
+            .order('is_pinned', { ascending: false })
+            .order('created_at', { ascending: false })
+            .limit(10);
+
+        if (error) throw error;
+        window.adminAnnouncements = data || [];
+        renderAnnouncements();
+    } catch (error) {
+        console.error('Erreur récupération annonces admin:', error);
+        window.adminAnnouncements = [];
+        renderAnnouncements();
+    }
+}
+
+function renderAnnouncements() {
+    const container = document.getElementById('announcements-container');
+    if (!container) return;
+    const announcements = window.adminAnnouncements || [];
+    if (announcements.length === 0) {
+        container.innerHTML = '';
+        container.style.display = 'none';
+        return;
+    }
+
+    container.style.display = 'grid';
+    container.innerHTML = announcements.map(item => {
+        const title = escapeHtml(item.title || 'Annonce');
+        const body = escapeHtml(item.body || '');
+        const createdAt = item.created_at ? new Date(item.created_at) : null;
+        const timeLabel = createdAt ? new Intl.DateTimeFormat('fr-FR', { day: 'numeric', month: 'short' }).format(createdAt) : '';
+        return `
+            <div class="announcement-card ${item.is_pinned ? 'pinned' : ''}">
+                <div class="announcement-header">
+                    <span class="announcement-title">${title}</span>
+                    ${item.is_pinned ? '<span class="announcement-pin">Épinglé</span>' : ''}
+                </div>
+                <p class="announcement-body">${body}</p>
+                <div class="announcement-meta">${timeLabel}</div>
+            </div>
+        `;
+    }).join('');
+}
+
+async function createAdminAnnouncement(payload) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error('Accès refusé', 'Vous devez être super-admin.');
+        return { success: false };
+    }
+    const title = String(payload?.title || '').trim();
+    const body = String(payload?.body || '').trim();
+    const isPinned = !!payload?.isPinned;
+
+    if (!title || !body) {
+        ToastManager?.info('Champs requis', 'Ajoutez un titre et un contenu.');
+        return { success: false };
+    }
+
+    try {
+        const { error } = await supabase
+            .from('admin_announcements')
+            .insert({
+                author_id: window.currentUser?.id || null,
+                title,
+                body,
+                is_pinned: isPinned
+            });
+        if (error) throw error;
+        ToastManager?.success('Annonce publiée', 'Votre message est en ligne.');
+        await fetchAdminAnnouncements();
+        return { success: true };
+    } catch (error) {
+        console.error('Erreur publication annonce:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de publier.');
+        return { success: false, error };
+    }
+}
+
+async function fetchVerificationRequests() {
+    if (!isVerificationAdmin()) {
+        verificationRequests = [];
+        return [];
+    }
+
+    try {
+        const { data, error } = await supabase
+            .from('verification_requests')
+            .select('id, user_id, type, status, created_at')
+            .eq('status', 'pending')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        verificationRequests = data || [];
+        return verificationRequests;
+    } catch (error) {
+        console.error('Erreur récupération demandes vérification:', error);
+        verificationRequests = [];
+        return [];
+    }
+}
+
+async function fetchUserPendingRequests(userId) {
+    try {
+        const { data, error } = await supabase
+            .from('verification_requests')
+            .select('type')
+            .eq('user_id', userId)
+            .eq('status', 'pending');
+
+        if (error) throw error;
+        const types = new Set();
+        (data || []).forEach(item => types.add(item.type));
+        return types;
+    } catch (error) {
+        console.error('Erreur récupération demandes utilisateur:', error);
+        return new Set();
+    }
+}
+
+function isVerificationAdmin() {
+    return !!window.currentUser && (VERIFICATION_ADMIN_IDS.has(window.currentUser.id) || isSuperAdmin());
+}
+
+function isVerifiedCreatorUserId(userId) {
+    return verifiedCreatorUserIds.has(userId);
+}
+
+function isVerifiedStaffUserId(userId) {
+    return verifiedStaffUserIds.has(userId);
+}
+
+function isCurrentUserVerified() {
+    const userId = window.currentUser && window.currentUser.id;
+    if (!userId) return false;
+    return isVerifiedCreatorUserId(userId) || isVerifiedStaffUserId(userId);
+}
+
+function isAmbassadorUserId(userId) {
+    return ambassadorUserIds.has(userId);
+}
+
+function renderAmbassadorBadgeById(userId) {
+    if (!isAmbassadorUserId(userId)) return '';
+    return `<img src="icons/embassadeur.svg?v=${BADGE_ASSET_VERSION}" alt="Ambassadeur" class="username-badge">`;
+}
+
+function renderVerificationBadgeById(userId) {
+    if (isVerifiedStaffUserId(userId)) {
+        return `<img src="icons/verify-com.svg?v=${BADGE_ASSET_VERSION}" alt="Équipe vérifiée" class="verification-badge">`;
+    }
+    if (isVerifiedCreatorUserId(userId)) {
+        return `<img src="icons/verify-personal.svg?v=${BADGE_ASSET_VERSION}" alt="Créateur vérifié" class="verification-badge">`;
+    }
+
+    const user = getUser(userId);
+    const badgeValue = user && user.badge ? String(user.badge).toLowerCase() : '';
+    const accountType = user && user.account_type ? String(user.account_type).toLowerCase() : '';
+    const accountSubtype = user && user.account_subtype ? String(user.account_subtype).toLowerCase() : '';
+    if (
+        badgeValue === 'staff' ||
+        badgeValue === 'team' ||
+        badgeValue === 'community' ||
+        badgeValue === 'company' ||
+        badgeValue === 'enterprise' ||
+        accountType === 'community' ||
+        accountType === 'enterprise' ||
+        accountSubtype === 'community' ||
+        accountSubtype === 'enterprise'
+    ) {
+        return `<img src="icons/verify-com.svg?v=${BADGE_ASSET_VERSION}" alt="Équipe vérifiée" class="verification-badge">`;
+    }
+    if (
+        badgeValue === 'creator' ||
+        badgeValue === 'personal' ||
+        badgeValue === 'verified' ||
+        accountType === 'personal' ||
+        accountSubtype === 'personal'
+    ) {
+        return `<img src="icons/verify-personal.svg?v=${BADGE_ASSET_VERSION}" alt="Créateur vérifié" class="verification-badge">`;
+    }
+    if (badgeValue === 'ambassador') {
+        return renderAmbassadorBadgeById(userId);
+    }
+
+    return '';
+}
+
+function renderVerificationBadgeOnly(userId) {
+    const verificationHtml = renderVerificationBadgeById(userId);
+    if (!verificationHtml) return '';
+    return `<div class="badge-container">${verificationHtml}</div>`;
+}
+
+function renderUsernameForProfile(nameHtml, userId) {
+    if (!nameHtml) return '';
+    const verificationHtml = renderVerificationBadgeById(userId);
+    if (verificationHtml) {
+        return `<span class="username-with-badge">${nameHtml}${verificationHtml}</span>`;
+    }
+    return renderUsernameWithBadge(nameHtml, userId);
+}
+
+function renderUsernameWithBadge(nameHtml, userId) {
+    if (!nameHtml) return '';
+    const verificationHtml = renderVerificationBadgeById(userId);
+    if (verificationHtml) {
+        return `<span class="username-with-badge">${nameHtml}${verificationHtml}</span>`;
+    }
+    const badgeHtml = renderAmbassadorBadgeById(userId);
+    if (!badgeHtml) return nameHtml;
+    return `<span class="username-with-badge">${nameHtml}${badgeHtml}</span>`;
+}
+
+function maybeShowAmbassadorWelcome(userId) {
+    if (!window.currentUser || !window.ToastManager) return;
+    if (window.currentUserId !== userId) return;
+    if (!isAmbassadorUserId(userId)) return;
+
+    const storageKey = `rize_ambassador_welcome_${userId}`;
+    if (localStorage.getItem(storageKey)) return;
+
+    ToastManager.success(
+        'Félicitations',
+        "Vous êtes l'un des premiers bêta testeurs. En guise de récompense, vous avez reçu un badge ambassadeur.",
+        7000
+    );
+    localStorage.setItem(storageKey, '1');
+}
+
+async function requestVerification(type) {
+    if (!window.currentUser || !window.ToastManager) return;
+    const userId = window.currentUser.id;
+    const pendingTypes = await fetchUserPendingRequests(userId);
+    if (pendingTypes.has(type)) {
+        ToastManager.info('Demande déjà envoyée', 'Nous avons bien reçu votre demande.');
+        return;
+    }
+
+    try {
+        const { error } = await supabase
+            .from('verification_requests')
+            .insert({
+                user_id: userId,
+                type: type,
+                status: 'pending'
+            });
+
+        if (error) throw error;
+        ToastManager.success('Demande envoyée', 'Votre demande de vérification a été enregistrée.');
+    } catch (error) {
+        console.error('Erreur demande vérification:', error);
+        ToastManager.error('Erreur', error?.message || 'Impossible d\'envoyer la demande.');
+    }
+
+    if (document.getElementById('settings-modal')?.classList.contains('active')) {
+        openSettings(userId);
+    }
+}
+
+async function addVerifiedUserId(type, userId) {
+    if (!userId) return;
+    const cleanId = String(userId).trim();
+    if (!cleanId) return;
+
+    try {
+        const { error } = await supabase
+            .from('verified_badges')
+            .upsert({
+                user_id: cleanId,
+                type: type
+            }, { onConflict: 'user_id,type' });
+
+        if (error) throw error;
+
+        await supabase
+            .from('verification_requests')
+            .update({ status: 'approved' })
+            .eq('user_id', cleanId)
+            .eq('type', type)
+            .eq('status', 'pending');
+
+        await fetchVerifiedBadges();
+
+        if (window.ToastManager) {
+            ToastManager.success('Badge appliqué', 'La vérification a été accordée.');
+        }
+    } catch (error) {
+        console.error('Erreur validation badge:', error);
+        if (window.ToastManager) {
+            ToastManager.error('Erreur', error?.message || 'Impossible d\'appliquer la vérification.');
+        }
+    }
+
+    if (document.getElementById('settings-modal')?.classList.contains('active') && window.currentUser) {
+        openSettings(window.currentUser.id);
+    }
+}
+
+async function handleVerificationSelection(action) {
+    const modal = document.getElementById('settings-modal');
+    if (!modal) return;
+
+    const checked = modal.querySelectorAll('.verification-request-check:checked');
+    if (!checked.length) return;
+
+    const toProcess = Array.from(checked).map(input => ({
+        userId: input.dataset.userId,
+        type: input.dataset.type
+    }));
+
+    try {
+        if (action === 'approve') {
+            await Promise.all(toProcess.map(item => {
+                return supabase
+                    .from('verified_badges')
+                    .upsert({ user_id: item.userId, type: item.type }, { onConflict: 'user_id,type' });
+            }));
+        }
+
+        await Promise.all(toProcess.map(item => {
+            return supabase
+                .from('verification_requests')
+                .update({ status: action === 'approve' ? 'approved' : 'rejected' })
+                .eq('user_id', item.userId)
+                .eq('type', item.type)
+                .eq('status', 'pending');
+        }));
+
+        await fetchVerifiedBadges();
+        await fetchVerificationRequests();
+
+        if (window.ToastManager) {
+            ToastManager.success('Mise à jour', action === 'approve' ? 'Vérifications accordées.' : 'Demandes refusées.');
+        }
+    } catch (error) {
+        console.error('Erreur mise à jour vérifications:', error);
+        if (window.ToastManager) {
+            ToastManager.error('Erreur', error?.message || 'Impossible de mettre à jour les vérifications.');
+        }
+    }
+
+    if (window.currentUser) {
+        openSettings(window.currentUser.id);
+    }
+}
+
+/* ========================================
+   SUPER ADMIN - MODÉRATION
+   ======================================== */
+
+async function banUserByAdmin(targetUserId, durationHours, reason) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error('Accès refusé', 'Vous devez être super-admin.');
+        return;
+    }
+    const cleanId = String(targetUserId || '').trim();
+    if (!cleanId) return;
+
+    const hours = Math.max(1, parseInt(durationHours, 10) || 0);
+    const until = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+    const cleanReason = String(reason || '').trim();
+
+    try {
+        const { error } = await supabase
+            .from('users')
+            .update({
+                banned_until: until,
+                banned_reason: cleanReason || null,
+                banned_by: window.currentUser?.id || null,
+                banned_at: new Date().toISOString()
+            })
+            .eq('id', cleanId);
+
+        if (error) throw error;
+        ToastManager?.success('Utilisateur banni', `Bannissement actif pour ${hours}h.`);
+        await loadAllData();
+        renderDiscoverGrid();
+    } catch (error) {
+        console.error('Erreur bannissement:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de bannir.');
+    }
+}
+
+async function unbanUserByAdmin(targetUserId) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error('Accès refusé', 'Vous devez être super-admin.');
+        return;
+    }
+    const cleanId = String(targetUserId || '').trim();
+    if (!cleanId) return;
+
+    try {
+        const { error } = await supabase
+            .from('users')
+            .update({
+                banned_until: null,
+                banned_reason: null,
+                banned_by: null,
+                banned_at: null
+            })
+            .eq('id', cleanId);
+
+        if (error) throw error;
+        ToastManager?.success('Utilisateur rétabli', 'Le bannissement est levé.');
+        await loadAllData();
+        renderDiscoverGrid();
+    } catch (error) {
+        console.error('Erreur unban:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de lever le ban.');
+    }
+}
+
+async function softDeleteContentByAdmin(contentId, reason) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error('Accès refusé', 'Vous devez être super-admin.');
+        return;
+    }
+    const cleanId = String(contentId || '').trim();
+    if (!cleanId) return;
+
+    try {
+        const { error } = await supabase
+            .from('content')
+            .update({
+                is_deleted: true,
+                deleted_at: new Date().toISOString(),
+                deleted_reason: String(reason || '').trim() || null,
+                deleted_by: window.currentUser?.id || null
+            })
+            .eq('id', cleanId);
+
+        if (error) throw error;
+        ToastManager?.success('Contenu masqué', 'Le contenu est supprimé côté public.');
+        await loadAllData();
+        renderDiscoverGrid();
+    } catch (error) {
+        console.error('Erreur suppression contenu:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de supprimer.');
+    }
+}
+
+async function restoreContentByAdmin(contentId) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error('Accès refusé', 'Vous devez être super-admin.');
+        return;
+    }
+    const cleanId = String(contentId || '').trim();
+    if (!cleanId) return;
+
+    try {
+        const { error } = await supabase
+            .from('content')
+            .update({
+                is_deleted: false,
+                deleted_at: null,
+                deleted_reason: null,
+                deleted_by: null
+            })
+            .eq('id', cleanId);
+
+        if (error) throw error;
+        ToastManager?.success('Contenu restauré', 'Le contenu est à nouveau visible.');
+        await loadAllData();
+        renderDiscoverGrid();
+    } catch (error) {
+        console.error('Erreur restauration contenu:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de restaurer.');
+    }
+}
+
+async function hardDeleteContentByAdmin(contentId) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error('Accès refusé', 'Vous devez être super-admin.');
+        return;
+    }
+    const cleanId = String(contentId || '').trim();
+    if (!cleanId) return;
+
+    if (!confirm('Supprimer définitivement ce contenu ?')) return;
+
+    try {
+        const { error } = await supabase
+            .from('content')
+            .delete()
+            .eq('id', cleanId);
+
+        if (error) throw error;
+        ToastManager?.success('Contenu supprimé', 'Suppression définitive effectuée.');
+        await loadAllData();
+        renderDiscoverGrid();
+    } catch (error) {
+        console.error('Erreur suppression définitive:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de supprimer.');
+    }
+}
+
+async function hardDeleteUserByAdmin(userId) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error('Accès refusé', 'Vous devez être super-admin.');
+        return;
+    }
+    const cleanId = String(userId || '').trim();
+    if (!cleanId) return;
+
+    if (!confirm('Supprimer définitivement cet utilisateur et son contenu ?')) return;
+
+    try {
+        const { error } = await supabase
+            .from('users')
+            .delete()
+            .eq('id', cleanId);
+
+        if (error) throw error;
+        ToastManager?.success('Utilisateur supprimé', 'Suppression définitive effectuée.');
+        await loadAllData();
+        renderDiscoverGrid();
+    } catch (error) {
+        console.error('Erreur suppression utilisateur:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de supprimer.');
+    }
+}
+
+const badgeSVGs = {
+    success: '<svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/></svg>',
+    failure: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 8l8 8M16 8l-8 8"/></svg>',
+    pause: '<svg viewBox="0 0 24 24"><rect x="6" y="4" width="3" height="16"/><rect x="15" y="4" width="3" height="16"/></svg>',
+    empty: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>',
+    consistency7: '<svg viewBox="0 0 24 24"><text x="12" y="16" text-anchor="middle" font-size="18" font-weight="bold">7</text></svg>',
+    consistency30: '<svg viewBox="0 0 24 24"><path d="M12 2c5.523 0 10 4.477 10 10s-4.477 10-10 10S2 17.523 2 12 6.477 2 12 2m0 2c-4.418 0-8 3.582-8 8s3.582 8 8 8 8-3.582 8-8-3.582-8-8-8z"/></svg>',
+    consistency100: '<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>',
+    consistency365: '<svg viewBox="0 0 24 24"><path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V8h14v11z"/></svg>',
+    solo: '<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M12 14c-4 0-6 2-6 2v4h12v-4s-2-2-6-2z"/></svg>',
+    team: '<svg viewBox="0 0 24 24"><circle cx="8" cy="8" r="3"/><circle cx="16" cy="8" r="3"/><path d="M8 11c-2 0-3 1-3 1v3h10v-3s-1-1-3-1z"/><path d="M16 11c-2 0-3 1-3 1v3h6v-3s-1-1-3-1z"/></svg>',
+    enterprise: '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="1"/><line x1="3" y1="8" x2="21" y2="8"/><line x1="9" y1="3" x2="9" y2="21"/></svg>',
+    creative: '<svg viewBox="0 0 24 24"><circle cx="15.5" cy="9.5" r="1.5"/><path d="M3 17.25V21h4v-3.75L3 17.25z"/><path d="M15 8.75h.01M21 19V9c0-1.1-.9-2-2-2h-4l-4-5-4 5H5c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2z"/></svg>',
+    tech: '<svg viewBox="0 0 24 24"><path d="M9 5H7.12A2.12 2.12 0 0 0 5 7.12v9.76A2.12 2.12 0 0 0 7.12 19h9.76A2.12 2.12 0 0 0 19 16.88V15m-6-9h6V5h-6v1z"/><path d="M9 9h6v6H9z"/></svg>',
+    transparent: '<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z"/></svg>'
+};
+
+function calculateConsistency(userId) {
+    const contents = getUserContentLocal(userId);
+    if (contents.length < 7) return null;
+    
+    const sortedByDay = [...contents].sort((a, b) => {
+        const dayA = a.dayNumber ?? a.day_number ?? 0;
+        const dayB = b.dayNumber ?? b.day_number ?? 0;
+        return dayA - dayB;
+    });
+    
+    let consecutiveDays = 1;
+    let maxConsecutive = 1;
+    
+    for (let i = 1; i < sortedByDay.length; i++) {
+        const currentDay = sortedByDay[i].dayNumber ?? sortedByDay[i].day_number ?? 0;
+        const previousDay = sortedByDay[i-1].dayNumber ?? sortedByDay[i-1].day_number ?? 0;
+        if (currentDay - previousDay === 1) {
+            consecutiveDays++;
+            maxConsecutive = Math.max(maxConsecutive, consecutiveDays);
+        } else {
+            consecutiveDays = 1;
+        }
+    }
+    
+    if (maxConsecutive >= 365) return 'consistency365';
+    if (maxConsecutive >= 100) return 'consistency100';
+    if (maxConsecutive >= 30) return 'consistency30';
+    if (maxConsecutive >= 7) return 'consistency7';
+    return null;
+}
+
+function determineTrajectoryType(userId) {
+    const user = getUser(userId);
+    const contents = getUserContentLocal(userId);
+    
+    if (!user || contents.length === 0) return null;
+    
+    const userTitle = user.title.toLowerCase();
+    const textContent = contents.map(c => (c.title + ' ' + c.description).toLowerCase()).join(' ') + ' ' + userTitle;
+    
+    if (textContent.includes('unreal') || userTitle.includes('designer') || textContent.includes('motion')) return 'creative';
+    if (textContent.includes('boss') || textContent.includes('game') || textContent.includes('indie')) return 'creative';
+    if (textContent.includes('ceo') || textContent.includes('entreprise')) return 'enterprise';
+    if (textContent.includes('refonte') || textContent.includes('ui') || textContent.includes('mobile')) return 'tech';
+    if (textContent.includes('architecture') || textContent.includes('api') || textContent.includes('database')) return 'tech';
+    
+    return 'solo';
+}
+
+function evaluateTransparency(userId) {
+    const contents = getUserContentLocal(userId);
+    if (contents.length === 0) return false;
+    
+    const failureCount = contents.filter(c => c.state === 'failure').length;
+    const ratio = failureCount / contents.length;
+    
+    return ratio >= 0.3;
+}
+
+function generateBadge(badgeType, label) {
+    const iconTypes = new Set(['team','enterprise','creative','tech','solo']);
+    if (iconTypes.has(badgeType)) {
+        const iconPath = `./icons/${badgeType}.svg`;
+        return `
+            <div class="badge" title="${label}">
+                <img src="${iconPath}" alt="${label}" class="badge-icon" />
+            </div>
+        `;
+    }
+    
+    const svg = badgeSVGs[badgeType];
+    if (!svg) return '';
+    
+    let cssClass = 'badge';
+    if (badgeType.startsWith('consistency')) cssClass += '';
+    else if (badgeType === 'success') cssClass += ' badge-success badge-filled';
+    else if (badgeType === 'failure') cssClass += ' badge-failure badge-filled';
+    else if (badgeType === 'pause') cssClass += ' badge-pause badge-filled';
+    else if (badgeType === 'empty') cssClass += '';
+    else if (badgeType === 'transparent') cssClass += ' badge-success';
+    else cssClass += '';
+    
+    return `
+        <div class="${cssClass}" title="${label}">
+            <div class="badge-icon">${svg}</div>
+            <span>${label}</span>
+        </div>
+    `;
+}
+
+function getUserBadges(userId) {
+    const badges = [];
+    
+    const trajectoryType = determineTrajectoryType(userId);
+    if (trajectoryType && trajectoryType !== 'solo') {
+        const labels = {
+            team: 'Collectif',
+            enterprise: 'Entreprise',
+            creative: 'Créatif',
+            tech: 'Tech'
+        };
+        badges.push({ type: trajectoryType, label: labels[trajectoryType] });
+    }
+    
+    const consistency = calculateConsistency(userId);
+    if (consistency) {
+        const labels = {
+            consistency7: '7j consécutifs',
+            consistency30: '30j consécutifs',
+            consistency100: '100j consécutifs',
+            consistency365: '365j consécutifs'
+        };
+        badges.push({ type: consistency, label: labels[consistency] });
+    }
+    
+    if (evaluateTransparency(userId)) {
+        badges.push({ type: 'transparent', label: 'Transparent' });
+    }
+    
+    return badges;
+}
+
+function getContentBadges(content) {
+    const badges = [];
+    
+    const stateLabels = {
+        success: 'Victoire',
+        failure: 'Bloqué',
+        pause: 'Pause',
+        empty: 'Vide'
+    };
+    
+    badges.push({ type: content.state, label: stateLabels[content.state] });
+    
+    return badges;
+}
+
+function renderBadges(badgesList) {
+    if (badgesList.length === 0) return '';
+    
+    return `
+        <div class="badge-container">
+            ${badgesList.map(b => generateBadge(b.type, b.label)).join('')}
+        </div>
+    `;
+}
+
+function renderUserBadges(userId) {
+    const verificationOnlyHtml = renderVerificationBadgeOnly(userId);
+    if (verificationOnlyHtml) return verificationOnlyHtml;
+    const userBadges = getUserBadges(userId);
+    return renderBadges(userBadges);
+}
+
+function normalizeExternalUrl(raw) {
+    if (!raw) return '';
+    let url = String(raw).trim();
+
+    url = url.replace(/^https\.[/\\]*/i, 'https://');
+    url = url.replace(/^http\.[/\\]*/i, 'http://');
+
+    if (url.startsWith('//')) return 'https:' + url;
+    if (/^https?:\/\//i.test(url)) return url;
+    return 'https://' + url;
+}
+
+function renderProfileSocialLinks(userId) {
+    const user = getUser(userId);
+    // Support both snake_case (DB) and camelCase (local update)
+    const socialLinks = user ? (user.social_links || user.socialLinks) : null;
+    
+    if (!user || !socialLinks || Object.keys(socialLinks).length === 0) {
+        return '';
+    }
+    
+    const platformLabels = {
+        email: 'Email',
+        github: 'GitHub',
+        youtube: 'YouTube',
+        twitter: 'X',
+        tiktok: 'TikTok',
+        linkedin: 'LinkedIn',
+        twitch: 'Twitch',
+        spotify: 'Spotify',
+        discord: 'Discord',
+        reddit: 'Reddit',
+        pinterest: 'Pinterest',
+        facebook: 'Facebook',
+        site: 'Site'
+    };
+    
+    const platformIcons = {
+        email: 'icons/email.svg',
+        github: 'icons/github.svg',
+        youtube: 'icons/youtube.svg',
+        twitter: 'icons/twitter.svg',
+        tiktok: 'icons/tiktok.svg',
+        linkedin: 'icons/linkedin.svg',
+        twitch: 'icons/twitch.svg',
+        spotify: 'icons/spotify.svg',
+        discord: 'icons/discord.svg',
+        reddit: 'icons/reddit.svg',
+        pinterest: 'icons/pinterest.svg',
+        facebook: 'icons/facebook.svg',
+        site: 'icons/link.svg'
+    };
+    
+    const socialHtml = Object.entries(socialLinks)
+        .filter(([_, url]) => url)
+        .map(([platform, url]) => {
+            const label = platformLabels[platform] || platform;
+            const iconPath = platformIcons[platform] || 'icons/link.svg';
+            if (platform === 'email') {
+                const email = String(url).trim();
+                const safeEmail = email.replace(/"/g, '&quot;');
+                return `
+                    <button type="button"
+                        class="social-badge"
+                        title="Afficher et copier l'email"
+                        onclick="handleEmailBadgeClick('${safeEmail}', this)">
+                        <img src="${iconPath}" alt="email" class="social-badge-icon" />
+                        <span class="email-reveal" style="display:none; margin-left:6px; font-size:0.85rem;"></span>
+                    </button>
+                `;
+            }
+            const safeUrl = normalizeExternalUrl(url);
+            return `
+                <a href="${safeUrl}" target="_blank" rel="noopener noreferrer" 
+                   class="social-badge" 
+                   title="Visiter ${label}">
+                    <img src="${iconPath}" alt="${platform}" class="social-badge-icon" />
+                </a>
+            `;
+        })
+        .join('');
+    
+    return socialHtml ? `<div class="profile-social-badges">${socialHtml}</div>` : '';
+}
+
+function handleEmailBadgeClick(email, el) {
+    const badge = el;
+    if (!badge) return;
+    const span = badge.querySelector('.email-reveal');
+    if (!span) return;
+
+    if (span.textContent !== email) {
+        span.textContent = email;
+    }
+    span.style.display = 'inline';
+
+    const doToast = (msg) => {
+        if (window.ToastManager && typeof window.ToastManager.success === 'function') {
+            window.ToastManager.success('Email', msg);
+        }
+    };
+
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(email).then(() => {
+            doToast('Copié dans le presse-papiers');
+        }).catch(() => {});
+    } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = email;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'absolute';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+            document.execCommand('copy');
+            doToast('Copié dans le presse-papiers');
+        } catch (e) {
+        }
+        document.body.removeChild(textarea);
+    }
+}
+
+/* ========================================
+   RENDERING - DISCOVER GRID
+   ======================================== */
+
+window.discoverFilter = 'all';
+
+window.toggleDiscoverFilter = function(filter) {
+    window.discoverFilter = filter;
+    
+    // Update UI buttons
+    document.querySelectorAll('.filter-btn').forEach(btn => {
+        // Reset styles
+        btn.classList.toggle('active', btn.dataset.filter === filter);
+        
+        if (btn.dataset.filter === filter) {
+             btn.style.color = 'var(--text-primary)';
+             btn.style.borderBottomColor = 'var(--accent-color)';
+             btn.style.opacity = '1';
+        } else {
+             btn.style.color = 'var(--text-secondary)';
+             btn.style.borderBottomColor = 'transparent';
+             btn.style.opacity = '0.7';
+        }
+    });
+    
+    renderDiscoverGrid();
+}
+
+function renderUserCard(userId, isFollowing = false, isEncouraged = false) {
+    const user = getUser(userId);
+    if (!user) return '';
+    
+    const latestContent = getLatestContent(userId);
+    const dominantState = getDominantState(userId);
+    
+    if (!latestContent) return '';
+    
+    const stateColor = dominantState === 'success' ? '#10b981' 
+                     : dominantState === 'failure' ? '#ef4444'
+                     : '#6366f1';
+    
+    const badgesHtml = renderUserBadges(userId);
+    
+    let mediaHtml = '';
+    if (latestContent && latestContent.mediaUrl) {
+        if (latestContent.type === 'video') {
+            mediaHtml = `
+                <div class="card-media-wrap">
+                    <video id="video-${userId}" class="card-media" src="${latestContent.mediaUrl}" muted playsinline webkit-playsinline autoplay preload="metadata" tabindex="-1" data-user-id="${userId}" disablePictureInPicture></video>
+                    <div class="video-fallback">
+                        <img src="icons/play.svg" alt="Play" width="40" height="40">
+                        <span>Vidéo</span>
+                    </div>
+                    <div class="card-stats-overlay">
+                        <div class="stat-pill">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                            <span>${latestContent.views || 0}</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        } else if (latestContent.type === 'image') {
+            mediaHtml = `
+                <div class="card-media-wrap">
+                    <img class="card-media" src="${latestContent.mediaUrl}" alt="${latestContent.title || 'Preview'}" loading="lazy" decoding="async">
+                    <div class="card-stats-overlay">
+                        <div class="stat-pill">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8  -4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                            <span>${latestContent.views || 0}</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+    }
+    
+    // Fallback for text-only content - display stats elsewhere?
+    // For now, let's assume media is primary. If no media, we can add stats to the card status line.
+    
+    // Déterminer la classe CSS selon le type de média pour l'adaptation
+    const cardClass = latestContent && latestContent.mediaUrl 
+        ? `user-card has-media ${latestContent.type}` 
+        : 'user-card';
+
+    // Ajout information ARC
+    let arcInfo = '';
+    if (latestContent && latestContent.arc) {
+        arcInfo = `
+            <div class="card-arc-info" style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.3rem;">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+                </svg>
+                <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;">
+                    ${latestContent.arc.title}
+                </span>
+            </div>
+        `;
+    }
+
+    // Subscribe Button
+    let subscribeBtn = '';
+    if (currentUser && currentUser.id !== userId) {
+        const btnClass = isFollowing ? 'btn-follow-card unfollow' : 'btn-follow-card';
+        // const btnText = isFollowing ? 'Abonné' : 'S\'abonner'; // REMOVED
+        const btnTitle = isFollowing ? 'Se désabonner' : 'S\'abonner';
+        const iconSrc = isFollowing ? 'icons/subscribed.svg' : 'icons/subscribe.svg';
+        
+        subscribeBtn = `
+            <button class="${btnClass}" onclick="event.stopPropagation(); toggleFollow('${currentUser.id}', '${userId}')" title="${btnTitle}" id="follow-card-btn-${userId}" style="
+                background: transparent; 
+                border: none;
+                padding: 0;
+                display: flex; 
+                align-items: center; 
+                justify-content: center; 
+                cursor: pointer;
+                margin-left: auto;
+                transition: all 0.2s;
+            ">
+                <img src="${iconSrc}" class="btn-icon" style="width: 24px; height: 24px;">
+            </button>
+        `;
+    }
+
+    // Courage Button
+    const courageIcon = isEncouraged ? 'icons/courage-green.svg' : 'icons/courage-blue.svg';
+    const courageClass = isEncouraged ? 'courage-btn encouraged' : 'courage-btn';
+    
+    // User Info (Name, Avatar, Subscribe) - Moved to bottom
+    const userInfoHtml = `
+        <div class="card-user-bottom" style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid rgba(255,255,255,0.05);">
+            <button class="profile-link" onclick="event.stopPropagation(); handleProfileClick('${userId}', this)">
+                <img src="${user.avatar || 'https://placehold.co/40'}" class="card-avatar" style="width: 32px; height: 32px;" loading="lazy" decoding="async">
+                <div class="profile-link-text" style="flex: 1; min-width: 0;">
+                    <h3 class="discover-user-name" style="margin:0; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${renderUsernameWithBadge(user.name, user.id)}</h3>
+                    <div style="font-size: 0.7rem; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${user.title || ''}</div>
+                </div>
+            </button>
+            ${subscribeBtn}
+        </div>
+    `;
+
+    // Add stats overlay CSS if needed (inline for now)
+    const statsStyles = `
+        <style>
+        .card-stats-overlay {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            display: flex;
+            gap: 5px;
+            pointer-events: none;
+        }
+        .stat-pill {
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(4px);
+            padding: 4px 8px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 0.75rem;
+            color: white;
+            font-weight: 600;
+        }
+        .courage-btn {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 20px;
+            padding: 4px 10px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            margin-top: 0.5rem;
+        }
+        .courage-btn:hover {
+            background: rgba(255,255,255,0.1);
+        }
+        .courage-btn.encouraged {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: rgba(16, 185, 129, 0.3);
+            color: #10b981;
+        }
+        </style>
+    `;
+
+    // Only inject style once
+    if (!document.getElementById('card-stats-style')) {
+        document.head.insertAdjacentHTML('beforeend', statsStyles.replace('<style>', '<style id="card-stats-style">'));
+    }
+
+    return `
+        <div class="${cardClass}" data-user="${userId}" onclick="openImmersive('${userId}', '${latestContent.contentId}')">
+            ${mediaHtml}
+            <div class="card-content">
+                ${arcInfo}
+                <div class="card-status" style="border-color: ${stateColor}20; color: ${stateColor};">
+                    <span class="status-day">J-${latestContent ? latestContent.dayNumber : 0}</span>
+                    ${latestContent ? latestContent.title : 'Aucune activité'}
+                </div>
+                
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    ${badgesHtml}
+                    <button class="${courageClass}" data-content-id="${latestContent.contentId}" onclick="event.stopPropagation(); toggleCourage('${latestContent.contentId}', this)">
+                        <img src="${courageIcon}" width="16" height="16">
+                        <span class="courage-count">${latestContent.encouragementsCount || 0}</span>
+                    </button>
+                </div>
+                
+                ${userInfoHtml}
+            </div>
+        </div>
+    `;
+}
+
+async function getLiveStreamsForDiscover() {
+    try {
+        const { data, error } = await supabase
+            .from('streaming_sessions')
+            .select('id, title, description, thumbnail_url, viewer_count, started_at, user_id, users(name, avatar)')
+            .eq('status', 'live')
+            .order('started_at', { ascending: false });
+        
+        if (error) throw error;
+        const streams = data || [];
+        if (streams.length === 0) return [];
+
+        // Filtrer les streams dont l'hôte est encore actif (heartbeat < 30s)
+        const streamIds = streams.map(s => s.id);
+        const hostKeySet = new Set(streams.map(s => `${s.id}:${s.user_id}`));
+        const cutoff = Date.now() - 30000;
+        const recentStartCutoff = Date.now() - 2 * 60 * 1000;
+
+        const { data: viewerData, error: viewerError } = await supabase
+            .from('stream_viewers')
+            .select('stream_id, user_id, last_seen')
+            .in('stream_id', streamIds);
+
+        if (viewerError) {
+            console.error('Erreur récupération présence host:', viewerError);
+            return streams;
+        }
+
+        const hostLastSeenMap = new Map();
+        (viewerData || []).forEach(row => {
+            if (!row?.stream_id || !row?.user_id) return;
+            const key = `${row.stream_id}:${row.user_id}`;
+            if (!hostKeySet.has(key)) return;
+            hostLastSeenMap.set(row.stream_id, row.last_seen);
+        });
+
+        return streams.filter(stream => {
+            const lastSeen = hostLastSeenMap.get(stream.id);
+            if (lastSeen) {
+                return new Date(lastSeen).getTime() >= cutoff;
+            }
+            // Fallback: afficher un live tout juste démarré même si le heartbeat n'est pas encore visible
+            if (stream.started_at) {
+                return new Date(stream.started_at).getTime() >= recentStartCutoff;
+            }
+            return false;
+        });
+    } catch (error) {
+        console.error('Erreur récupération lives:', error);
+        return [];
+    }
+}
+
+function renderLiveStreamCard(stream) {
+    if (!document.getElementById('card-stats-style')) {
+        const statsStyles = `
+            <style>
+            .card-stats-overlay {
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                display: flex;
+                gap: 5px;
+                pointer-events: none;
+            }
+            .stat-pill {
+                background: rgba(0,0,0,0.6);
+                backdrop-filter: blur(4px);
+                padding: 4px 8px;
+                border-radius: 12px;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                font-size: 0.75rem;
+                color: white;
+                font-weight: 600;
+            }
+            </style>
+        `;
+        document.head.insertAdjacentHTML('beforeend', statsStyles.replace('<style>', '<style id="card-stats-style">'));
+    }
+
+    const hostName = stream.users?.name || 'Hôte';
+    const hostId = stream.user_id || null;
+    const hostAvatar = stream.users?.avatar || 'https://placehold.co/40';
+    const title = stream.title || 'Live Stream';
+    const description = stream.description || 'Rejoignez le live en cours';
+    const viewers = stream.viewer_count || 0;
+    const thumbnail = stream.thumbnail_url || '';
+
+    const hostNameHtml = hostId && typeof window.renderUsernameWithBadge === 'function'
+        ? window.renderUsernameWithBadge(hostName, hostId)
+        : hostName;
+
+    const mediaHtml = thumbnail
+        ? `
+            <div class="card-media-wrap">
+                <img class="card-media" src="${thumbnail}" alt="${title}" loading="lazy" decoding="async">
+                <div class="card-stats-overlay">
+                    <div class="stat-pill">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                        <span>${viewers}</span>
+                    </div>
+                </div>
+            </div>
+        `
+        : `
+            <div class="card-media-wrap">
+                <div class="video-fallback" style="opacity:1;">
+                    <img src="icons/live.svg" alt="Live" width="36" height="36">
+                    <span>Live en cours</span>
+                </div>
+                <div class="card-stats-overlay">
+                    <div class="stat-pill">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                        <span>${viewers}</span>
+                    </div>
+                </div>
+            </div>
+        `;
+
+    return `
+        <div class="user-card has-media live" data-stream="${stream.id}" onclick="window.location.href='stream.html?id=${stream.id}&title=${encodeURIComponent(title)}&host=${stream.user_id}'">
+            ${mediaHtml}
+            <div class="card-content">
+                <div class="card-status" style="border-color: #ef444420; color: #ef4444;">
+                    🔴 En direct • ${title}
+                </div>
+                <div style="font-size: 0.85rem; color: var(--text-secondary);">${description}</div>
+                <div class="card-user-bottom" style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid rgba(255,255,255,0.05);">
+                    <img src="${hostAvatar}" class="card-avatar" style="width: 32px; height: 32px;" loading="lazy" decoding="async">
+                    <div class="profile-link-text" style="flex: 1; min-width: 0;">
+                        <h3 class="discover-user-name" style="margin:0; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${hostNameHtml}</h3>
+                        <div style="font-size: 0.7rem; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Streamer</div>
+                    </div>
+                    <button class="btn-follow-card" onclick="event.stopPropagation(); window.location.href='stream.html?id=${stream.id}&title=${encodeURIComponent(title)}&host=${stream.user_id}'" title="Rejoindre le live" style="
+                        background: transparent; 
+                        border: none;
+                        padding: 0;
+                        display: flex; 
+                        align-items: center; 
+                        justify-content: center; 
+                        cursor: pointer;
+                        margin-left: auto;
+                        transition: all 0.2s;
+                    ">
+                        <img src="icons/live.svg" class="btn-icon" style="width: 24px; height: 24px;">
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+async function renderDiscoverGrid() {
+    const grid = document.querySelector('.discover-grid');
+    if (!grid) return;
+    const waitMessage = document.querySelector('.wait');
+    
+    // Afficher un état de chargement si les données ne sont pas encore là
+    if (!window.hasLoadedUsers) {
+        if (window.LoadingStateManager && typeof LoadingStateManager.showSpinner === 'function') {
+            LoadingStateManager.showSpinner(grid);
+        }
+        return;
+    }
+    if (window.userLoadError) {
+        if (window.LoadingStateManager && typeof LoadingStateManager.showEmptyState === 'function') {
+            LoadingStateManager.showEmptyState(
+                grid,
+                '⚠️',
+                'Impossible de charger le contenu',
+                window.userLoadError,
+                { text: 'Réessayer', action: 'location.reload()' }
+            );
+        } else {
+            grid.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">⚠️</div>
+                    <h3>Impossible de charger le contenu</h3>
+                    <p>${window.userLoadError}</p>
+                </div>
+            `;
+        }
+        return;
+    }
+    if (allUsers.length === 0) {
+        if (window.LoadingStateManager && typeof LoadingStateManager.showEmptyState === 'function') {
+            LoadingStateManager.showEmptyState(
+                grid,
+                '👥',
+                'Aucune trajectoire à explorer',
+                'Revenez plus tard pour découvrir de nouvelles trajectoires.',
+                { text: 'Actualiser', action: 'location.reload()' }
+            );
+        } else {
+            grid.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">👥</div>
+                    <h3>Aucune trajectoire à explorer</h3>
+                    <p>Revenez plus tard pour découvrir de nouvelles trajectoires.</p>
+                </div>
+            `;
+        }
+        return;
+    }
+    
+    let usersToDisplay = [...allUsers];
+    const currentFilter = window.discoverFilter || 'all';
+    let cardsHTML = '';
+    let liveCardsHTML = '';
+
+    // Sort users by their latest content date (newest first)
+    usersToDisplay.sort((a, b) => {
+        const aLatest = getLatestContent(a.id);
+        const bLatest = getLatestContent(b.id);
+        const aTime = aLatest && aLatest.createdAt ? new Date(aLatest.createdAt).getTime() : 0;
+        const bTime = bLatest && bLatest.createdAt ? new Date(bLatest.createdAt).getTime() : 0;
+        return bTime - aTime;
+    });
+
+    // Live streams (always on top)
+    const liveStreams = await getLiveStreamsForDiscover();
+    if (liveStreams.length > 0) {
+        liveCardsHTML = liveStreams.map(renderLiveStreamCard).join('');
+    }
+
+    if (currentUser) {
+        // Collect all latest content IDs to check encouragements in one go
+        const contentIds = [];
+        const userContentMap = new Map();
+        
+        usersToDisplay.forEach(u => {
+            const c = getLatestContent(u.id);
+            if (c) {
+                contentIds.push(c.contentId);
+                userContentMap.set(u.id, c.contentId);
+            }
+        });
+
+        // Batch fetch encouragements
+        let encouragedContentIds = new Set();
+        if (contentIds.length > 0) {
+            const { data, error } = await supabase
+                .from('content_encouragements')
+                .select('content_id')
+                .eq('user_id', currentUser.id)
+                .in('content_id', contentIds);
+                
+            if (data) {
+                data.forEach(row => encouragedContentIds.add(row.content_id));
+            }
+        }
+
+        // Fetch follow status for all users in parallel
+        const followPromises = usersToDisplay.map(async user => {
+            const isFollowed = await isFollowing(currentUser.id, user.id);
+            const contentId = userContentMap.get(user.id);
+            const isEncouraged = contentId ? encouragedContentIds.has(contentId) : false;
+            return { user, isFollowed, isEncouraged };
+        });
+        
+        const results = await Promise.all(followPromises);
+        
+        // Filter based on logic
+        if (currentFilter === 'following') {
+            const following = results.filter(r => r.isFollowed);
+            cardsHTML = following.map(r => renderUserCard(r.user.id, true, r.isEncouraged)).join('');
+        } else {
+            // Render "All" but pass correct follow status
+            cardsHTML = results.map(r => renderUserCard(r.user.id, r.isFollowed, r.isEncouraged)).filter(h => h !== '').join('');
+        }
+    } else {
+        // Not logged in
+        if (currentFilter === 'following') {
+             cardsHTML = '<div style="grid-column:1/-1; text-align:center; padding:2rem; color:var(--text-secondary);">Connectez-vous pour voir vos abonnements.</div>';
+        } else {
+            cardsHTML = usersToDisplay.map(user => renderUserCard(user.id, false, false)).filter(h => h !== '').join('');
+        }
+    }
+    
+    if (liveCardsHTML !== '' || cardsHTML !== '') {
+        grid.innerHTML = `${liveCardsHTML}${cardsHTML}`;
+
+        if (waitMessage) {
+            const hasCard = grid.querySelector('.user-card, .discover-card');
+            if (hasCard) {
+                waitMessage.classList.add('is-hidden');
+            }
+        }
+        
+        // Animations d'apparition progressives
+        if (window.AnimationManager) {
+            setTimeout(() => {
+                AnimationManager.fadeInElements('.discover-card', 150);
+                AnimationManager.fadeInElements('.user-card', 150);
+            }, 100);
+        }
+        
+        setupDiscoverVideoInteractions();
+        return;
+    }
+
+    if (cardsHTML === '') {
+        if (window.LoadingStateManager && typeof LoadingStateManager.showEmptyState === 'function') {
+            LoadingStateManager.showEmptyState(
+                grid,
+                '👥',
+                'Aucune trajectoire à explorer',
+                'Revenez plus tard pour découvrir de nouvelles trajectoires.',
+                { text: 'Actualiser', action: 'location.reload()' }
+            );
+        } else {
+            grid.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">👥</div>
+                    <h3>Aucune trajectoire à explorer</h3>
+                    <p>Revenez plus tard pour découvrir de nouvelles trajectoires.</p>
+                </div>
+            `;
+        }
+        if (waitMessage) waitMessage.classList.add('is-hidden');
+    } else {
+        grid.innerHTML = cardsHTML;
+
+        if (waitMessage) {
+            waitMessage.classList.add('is-hidden');
+        }
+        
+        // Animations d'apparition progressives
+        if (window.AnimationManager) {
+            setTimeout(() => {
+                AnimationManager.fadeInElements('.discover-card', 150);
+                AnimationManager.fadeInElements('.user-card', 150);
+            }, 100);
+        }
+    }
+    
+    setupDiscoverVideoInteractions();
+}
+
+/* ========================================
+   RENDERING - IMMERSIVE VIEW
+   ======================================== */
+
+// Helper to gather all content for the feed
+function getAllFeedContent() {
+    let allContent = [];
+    if (typeof userContents !== 'undefined') {
+        Object.values(userContents).forEach(userContentList => {
+            if (Array.isArray(userContentList)) {
+                allContent = allContent.concat(userContentList);
+            }
+        });
+    }
+    // Sort by createdAt descending (newest first)
+    return allContent.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+function loadImmersivePrefs() {
+    try {
+        const raw = localStorage.getItem('immersive_prefs_v1');
+        if (!raw) return { types: {}, states: {}, users: {}, seen: {} };
+        const parsed = JSON.parse(raw);
+        return {
+            types: parsed.types || {},
+            states: parsed.states || {},
+            users: parsed.users || {},
+            seen: parsed.seen || {}
+        };
+    } catch (e) {
+        return { types: {}, states: {}, users: {}, seen: {} };
+    }
+}
+
+function saveImmersivePrefs(prefs) {
+    try {
+        localStorage.setItem('immersive_prefs_v1', JSON.stringify(prefs));
+    } catch (e) {
+        // Ignore storage errors
+    }
+}
+
+function bumpPref(map, key, amount) {
+    if (!key) return;
+    map[key] = (map[key] || 0) + amount;
+}
+
+function prunePrefsObject(obj, maxEntries = 200) {
+    const keys = Object.keys(obj || {});
+    if (keys.length <= maxEntries) return obj;
+    keys.sort((a, b) => (obj[b] || 0) - (obj[a] || 0));
+    const trimmed = {};
+    keys.slice(0, maxEntries).forEach(k => {
+        trimmed[k] = obj[k];
+    });
+    return trimmed;
+}
+
+function pruneSeen(seenMap, maxEntries = 600) {
+    const entries = Object.entries(seenMap || {});
+    if (entries.length <= maxEntries) return seenMap;
+    entries.sort((a, b) => (a[1] || 0) - (b[1] || 0));
+    const trimmed = {};
+    entries.slice(entries.length - maxEntries).forEach(([k, v]) => {
+        trimmed[k] = v;
+    });
+    return trimmed;
+}
+
+function updateImmersivePrefs(content, action) {
+    if (!content) return;
+    const prefs = loadImmersivePrefs();
+    const weight = action === 'like' ? 2.4 : action === 'view' ? 0.35 : 0.6;
+    bumpPref(prefs.types, content.type, weight);
+    bumpPref(prefs.states, content.state, weight * 0.6);
+    bumpPref(prefs.users, content.userId, weight * 0.9);
+    prefs.seen[content.contentId] = Date.now();
+    prefs.types = prunePrefsObject(prefs.types, 80);
+    prefs.states = prunePrefsObject(prefs.states, 30);
+    prefs.users = prunePrefsObject(prefs.users, 120);
+    prefs.seen = pruneSeen(prefs.seen, 600);
+    saveImmersivePrefs(prefs);
+}
+
+function findContentById(contentId) {
+    if (!contentId || typeof userContents === 'undefined') return null;
+    for (const list of Object.values(userContents)) {
+        if (!Array.isArray(list)) continue;
+        const hit = list.find(item => item.contentId === contentId);
+        if (hit) return hit;
+    }
+    return null;
+}
+
+async function getFollowedUserIdSet() {
+    if (!currentUser) return new Set();
+    try {
+        const { data, error } = await supabase
+            .from('followers')
+            .select('following_id')
+            .eq('follower_id', currentUser.id);
+        if (error) throw error;
+        return new Set((data || []).map(row => row.following_id));
+    } catch (e) {
+        console.error('Error fetching followed users for personalization:', e);
+        return new Set();
+    }
+}
+
+function scoreImmersiveContent(content, context) {
+    const now = context.now || Date.now();
+    const createdAt = content.createdAt ? new Date(content.createdAt).getTime() : now;
+    const ageHours = Math.max(0, (now - createdAt) / (1000 * 60 * 60));
+    const recency = Math.exp(-ageHours / 72); // 3 days half-ish
+    const engagement = Math.log1p(content.encouragementsCount || 0) * 1.2 + Math.log1p(content.views || 0) * 0.5;
+    const followBoost = context.followedSet && context.followedSet.has(content.userId) ? 2.0 : 0;
+    const typePref = (context.prefs.types[content.type] || 0) * 0.45;
+    const statePref = (context.prefs.states[content.state] || 0) * 0.25;
+    const userPref = (context.prefs.users[content.userId] || 0) * 0.7;
+    const seenPenalty = context.prefs.seen && context.prefs.seen[content.contentId] ? 0.8 : 0;
+    const base = recency * 2.2 + engagement + followBoost + typePref + statePref + userPref - seenPenalty;
+    return base + (Math.random() * 0.08);
+}
+
+function interleaveByUser(contents) {
+    const buckets = new Map();
+    contents.forEach(item => {
+        if (!buckets.has(item.userId)) buckets.set(item.userId, []);
+        buckets.get(item.userId).push(item);
+    });
+    const result = [];
+    let added = true;
+    while (added) {
+        added = false;
+        for (const [userId, list] of buckets.entries()) {
+            if (list.length > 0) {
+                result.push(list.shift());
+                added = true;
+            }
+        }
+    }
+    return result;
+}
+
+async function getPersonalizedFeed(contents) {
+    if (!currentUser || !Array.isArray(contents) || contents.length < 3) return contents;
+    const prefs = loadImmersivePrefs();
+    const followedSet = await getFollowedUserIdSet();
+    const now = Date.now();
+    const scored = contents.map(item => ({
+        item,
+        score: scoreImmersiveContent(item, { prefs, followedSet, now })
+    }));
+    scored.sort((a, b) => b.score - a.score);
+    const ranked = scored.map(s => s.item);
+    return interleaveByUser(ranked);
+}
+
+// Helper to render header
+async function renderImmersiveHeader(user) {
+    let subscribeBtnHtml = '';
+    
+    if (user && currentUser && currentUser.id !== user.id) {
+        try {
+            const isFollowingUser = await isFollowing(currentUser.id, user.id);
+            const btnClass = isFollowingUser ? 'btn-follow-immersive unfollow' : 'btn-follow-immersive';
+            const iconSrc = isFollowingUser ? 'icons/subscribed.svg' : 'icons/subscribe.svg';
+            
+            subscribeBtnHtml = `
+                <button id="follow-immersive-btn-${user.id}" class="${btnClass}" onclick="event.stopPropagation(); toggleFollow('${currentUser.id}', '${user.id}')" style="background: transparent; border: none; padding: 0;">
+                    <img src="${iconSrc}" class="btn-icon" style="width: 24px; height: 24px;">
+                </button>
+            `;
+        } catch(e) { console.error(e); }
+    } else if (!user) {
+         return '';
+    }
+    
+    return `
+        <div class="immersive-header" id="immersive-header-content">
+            <button class="profile-link immersive-profile-link" onclick="event.stopPropagation(); handleProfileClick('${user.id}', this, true)">
+                <img src="${user.avatar || 'https://placehold.co/40'}" class="immersive-user-avatar">
+                <span class="immersive-user-name">${renderUsernameWithBadge(user.name, user.id)}</span>
+            </button>
+            ${subscribeBtnHtml}
+        </div>
+    `;
+}
+
+async function renderImmersiveFeed(contents) {
+    let encouragedContentIds = new Set();
+    const followMap = new Map();
+    
+    // Fetch user encouragements if logged in
+    if (currentUser && contents.length > 0) {
+        try {
+            const contentIds = contents.map(c => c.contentId);
+            // Limit request size if too many items
+            const batchIds = contentIds.slice(0, 500); 
+            
+            const { data } = await supabase
+                .from('content_encouragements')
+                .select('content_id')
+                .eq('user_id', currentUser.id)
+                .in('content_id', batchIds);
+            
+            if (data) {
+                data.forEach(row => encouragedContentIds.add(row.content_id));
+            }
+        } catch (e) {
+            console.error('Error fetching encouragements:', e);
+        }
+
+        try {
+            const uniqueUserIds = Array.from(new Set(contents.map(c => c.userId)));
+            if (uniqueUserIds.length > 0) {
+                const { data: followData } = await supabase
+                    .from('followers')
+                    .select('following_id')
+                    .eq('follower_id', currentUser.id)
+                    .in('following_id', uniqueUserIds);
+                if (followData) {
+                    followData.forEach(row => followMap.set(row.following_id, true));
+                }
+            }
+        } catch (e) {
+            console.error('Error fetching follow status for immersive feed:', e);
+        }
+    }
+    
+    return contents.map(content => {
+        const stateLabel = content.state === 'success' ? '#Victoire'
+                         : content.state === 'failure' ? '#Bloqué'
+                         : '#Pause';
+        
+        const contentBadges = getContentBadges(content);
+        // Include user badges as well (consistent with Discover cards)
+        const contentBadgesHtml = renderBadges(contentBadges);
+        const userBadgesHtml = renderUserBadges(content.userId);
+        const badgesHtml = contentBadgesHtml + userBadgesHtml;
+        const contentUser = getUser(content.userId);
+        const contentUserName = contentUser ? contentUser.name : 'Utilisateur';
+        const contentUserNameHtml = contentUser ? renderUsernameWithBadge(contentUserName, contentUser.id) : contentUserName;
+        const contentUserAvatar = contentUser && contentUser.avatar ? contentUser.avatar : 'https://placehold.co/40';
+        const isFollowingUser = currentUser ? followMap.get(content.userId) === true : false;
+        const followIconSrc = isFollowingUser ? 'icons/subscribed.svg' : 'icons/subscribe.svg';
+        const followBtnClass = isFollowingUser ? 'btn-follow-immersive inline unfollow' : 'btn-follow-immersive inline';
+
+        let mediaHtml = '';
+        if (content.mediaUrl) {
+            if (content.type === 'video') {
+                mediaHtml = `
+                    <div class="immersive-video-wrap" style="position: relative; width: 100%; height: 100%;">
+                        <video id="immersive-video-${content.contentId}" class="immersive-video" src="${content.mediaUrl}" playsinline webkit-playsinline autoplay muted preload="auto" style="width: 100%; height: 100%; object-fit: cover;" data-content-id="${content.contentId}" disablePictureInPicture></video>
+                        <div class="video-fallback">
+                            <img src="icons/play.svg" alt="Play" width="56" height="56">
+                            <span>Vidéo</span>
+                        </div>
+                        <img class="immersive-video-play" src="icons/play.svg" alt="Play" style="position:absolute; left:50%; top:50%; transform:translate(-50%, -50%); width:64px; height:64px; opacity:0.9; display:none; pointer-events:none;" />
+                    </div>
+                `;
+            } else {
+                mediaHtml = `<img src="${content.mediaUrl}" style="width: 100%; height: 100%; object-fit: cover;">`;
+            }
+        } else {
+            mediaHtml = `<div style="height: 100%; background: linear-gradient(135deg, #1a1a1a 0%, #0a0a0a 100%); display: flex; align-items: center; justify-content: center; color: #333; font-size: 0.9rem;">Jour ${content.dayNumber}</div>`;
+        }
+        
+        const isEncouraged = encouragedContentIds.has(content.contentId);
+        const courageIcon = isEncouraged ? 'icons/courage-green.svg' : 'icons/courage-blue.svg';
+        const courageClass = isEncouraged ? 'courage-btn encouraged' : 'courage-btn';
+        
+        return `
+            <div class="immersive-post" data-content-id="${content.contentId}" data-user-id="${content.userId}">
+                <div class="post-content-wrap">
+                    ${mediaHtml}
+                    <div class="post-info">
+                        <span class="step-indicator">Jour ${content.dayNumber}</span>
+                        <span class="state-tag">${stateLabel}</span>
+                        
+                        <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                            <h2>${content.title}</h2>
+                            <div class="post-stats" style="display:flex; gap:1rem;">
+                                <div class="stat-pill" title="Vues">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                                    <span>${content.views || 0}</span>
+                                </div>
+                                <button class="${courageClass}" data-content-id="${content.contentId}" onclick="event.stopPropagation(); toggleCourage('${content.contentId}', this)" title="Encourager">
+                                    <img src="${courageIcon}" width="16" height="16">
+                                    <span class="courage-count">${content.encouragementsCount || 0}</span>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <p>${content.description}</p>
+                        <div class="immersive-post-user">
+                            <button class="profile-link immersive-profile-link" onclick="event.stopPropagation(); handleProfileClick('${content.userId}', this, true)">
+                                <img src="${contentUserAvatar}" alt="Avatar de ${contentUserName}" class="immersive-post-user-avatar">
+                                <span class="immersive-post-user-name">${contentUserNameHtml}</span>
+                            </button>
+                            ${currentUser && currentUser.id !== content.userId ? `
+                                <button class="${followBtnClass}" data-follow-user="${content.userId}" onclick="event.stopPropagation(); toggleFollow('${currentUser.id}', '${content.userId}')">
+                                    <img src="${followIconSrc}" class="btn-icon" style="width: 20px; height: 20px;">
+                                </button>
+                            ` : ''}
+                        </div>
+                        <div class="badges-immersive">
+                            ${badgesHtml}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+// Backward compatibility
+async function renderImmersiveContent(userId) {
+    const contents = getUserContentLocal(userId);
+    return renderImmersiveFeed(contents);
+}
+
+async function openImmersive(startUserId, startContentId = null) {
+    console.log('Opening immersive for user:', startUserId);
+    
+    // Vérifier si les données sont chargées
+    if (!allUsers || allUsers.length === 0) {
+        console.error('Users data not loaded');
+        alert('Chargement des données en cours, veuillez réessayer...');
+        return;
+    }
+    
+    if (!userContents || Object.keys(userContents).length === 0) {
+        console.error('Content data not loaded');
+        alert('Aucun contenu disponible pour le moment');
+        return;
+    }
+    
+    const overlay = document.getElementById('immersive-overlay');
+    
+    if (!overlay) {
+        console.error('Immersive overlay not found');
+        return;
+    }
+    
+    // Initial loading state
+    overlay.innerHTML = `
+        <div class="close-immersive" onclick="closeImmersive()">✕</div>
+        <div id="immersive-content-container" style="display:flex;justify-content:center;align-items:center;height:100vh;color:white;">Chargement...</div>
+    `;
+    overlay.style.display = 'block';
+    document.body.style.overflow = 'hidden';
+
+    try {
+        // Get ALL content sorted by date, then personalize
+        let allContents = await getPersonalizedFeed(getAllFeedContent());
+        console.log('All contents found:', allContents.length);
+        
+        if (allContents.length === 0) {
+            overlay.innerHTML = `
+                <div class="close-immersive" onclick="closeImmersive()">✕</div>
+                <div style="display:flex;justify-content:center;align-items:center;height:100vh;color:white;">
+                    <div style="text-align:center;">
+                        <h3>Aucun contenu disponible</h3>
+                        <p>Les utilisateurs n'ont pas encore publié de contenu</p>
+                    </div>
+                </div>
+            `;
+            return;
+        }
+        
+        // Ensure the clicked content is first in the personalized feed
+        let startIndex = -1;
+        if (startContentId) {
+            startIndex = allContents.findIndex(c => c.contentId === startContentId);
+        } else {
+            const latest = getLatestContent(startUserId);
+            startIndex = latest ? allContents.findIndex(c => c.contentId === latest.contentId) : -1;
+        }
+        if (startIndex > 0) {
+            const [pinned] = allContents.splice(startIndex, 1);
+            allContents.unshift(pinned);
+            startIndex = 0;
+            if (pinned && pinned.userId) {
+                startUserId = pinned.userId;
+            }
+        }
+        console.log('Start index:', startIndex, 'Start content:', startContentId || '(latest)');
+        
+        // Render all content
+        const contentHtml = await renderImmersiveFeed(allContents);
+        
+        // Initial header for the starting user
+        const user = getUser(startUserId);
+        if (!user) {
+            console.error('User not found:', startUserId);
+            alert('Utilisateur non trouvé');
+            closeImmersive();
+            return;
+        }
+        
+        const headerHtml = await renderImmersiveHeader(user);
+        
+        // Header Styles & HTML
+        const headerStyle = `
+            <style>
+                .immersive-header {
+                    position: absolute;
+                    top: 20px;
+                    left: 20px;
+                    z-index: 100;
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    pointer-events: none;
+                    transition: opacity 0.3s;
+                }
+                .immersive-header > * {
+                    pointer-events: auto;
+                }
+                .immersive-user-avatar {
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 50%;
+                    border: 2px solid rgba(255,255,255,0.8);
+                    object-fit: cover;
+                    cursor: pointer;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+                }
+                .immersive-user-name {
+                    color: white;
+                    font-weight: 600;
+                    cursor: pointer;
+                    font-size: 1.1rem;
+                }
+                .btn-follow-immersive {
+                    background: rgba(255,255,255,0.2);
+                    border: 1px solid rgba(255,255,255,0.3);
+                    border-radius: 20px;
+                    padding: 6px 12px;
+                    color: white;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                }
+                .btn-follow-immersive:hover {
+                    background: rgba(255,255,255,0.3);
+                }
+                .btn-follow-immersive.unfollow {
+                    background: rgba(16,185,129,0.8);
+                    border-color: rgba(16,185,129,0.9);
+                }
+                .close-immersive {
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    z-index: 1001;
+                    width: 40px;
+                    height: 40px;
+                    background: rgba(0,0,0,0.8);
+                    border: none;
+                    border-radius: 50%;
+                    color: white;
+                    font-size: 1.2rem;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                .close-immersive:hover {
+                    background: rgba(0,0,0,0.9);
+                }
+            </style>
+        `;
+        
+        // Assemble final HTML
+        overlay.innerHTML = `
+            ${headerStyle}
+            <div class="close-immersive" onclick="closeImmersive()">✕</div>
+            <div id="immersive-header-container">
+                ${headerHtml}
+            </div>
+            <div id="immersive-content-container">
+                ${contentHtml}
+            </div>
+        `;
+        
+        // Scroll to the starting content
+        if (startIndex >= 0) {
+            setTimeout(() => {
+                const startElement = document.querySelector(`[data-content-id="${allContents[startIndex].contentId}"]`);
+                if (startElement) {
+                    startElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            }, 100);
+        }
+        
+        // Setup immersive interactions
+        // setupImmersiveInteractions(); // Commenté pour l'instant
+        
+        // Setup video play/pause on scroll
+        setTimeout(() => {
+            setupImmersiveObserver();
+            setupImmersiveVideoUI();
+            setupImmersiveSnapNav();
+            setupImmersiveKeyboardNav();
+        }, 100);
+        
+    } catch (error) {
+        console.error('Error opening immersive:', error);
+        overlay.innerHTML = `
+            <div class="close-immersive" onclick="closeImmersive()">✕</div>
+            <div style="display:flex;justify-content:center;align-items:center;height:100vh;color:white;">
+                <div style="text-align:center;">
+                    <h3>Erreur de chargement</h3>
+                    <p>${error.message}</p>
+                    <button onclick="closeImmersive()" style="margin-top: 1rem; padding: 0.5rem 1rem; background: #333; border: none; border-radius: 4px; color: white; cursor: pointer;">Fermer</button>
+                </div>
+            </div>
+        `;
+    }
+}
+
+function closeImmersive() {
+    document.getElementById('immersive-overlay').style.display = 'none';
+    document.body.style.overflow = 'auto';
+}
+
+let currentImmersiveUser = null;
+
+function setupImmersiveObserver() {
+    const posts = document.querySelectorAll('.immersive-post');
+    const headerContainer = document.getElementById('immersive-header-container');
+    
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            const video = entry.target.querySelector('video.immersive-video');
+            
+            if (entry.isIntersecting) {
+                // La vidéo est visible - la jouer
+                if (video) {
+                    video.muted = !window.__immersiveSoundUnlocked;
+                    video.play().catch(error => {
+                        console.log('Autoplay bloqué, attente interaction:', error);
+                    });
+                }
+                
+                const contentId = entry.target.dataset.contentId;
+                const userId = entry.target.dataset.userId;
+                
+                // View counting
+                if (contentId && !entry.target.dataset.viewed) {
+                    entry.target.dataset.viewed = 'true';
+                    incrementViews(contentId);
+                    const content = findContentById(contentId);
+                    updateImmersivePrefs(content, 'view');
+                    
+                    const viewCountSpan = entry.target.querySelector('.stat-pill span');
+                    if (viewCountSpan) {
+                         const current = parseInt(viewCountSpan.textContent) || 0;
+                         viewCountSpan.textContent = current + 1;
+                    }
+                }
+                
+                // Update Header if user changed
+                if (userId && userId !== currentImmersiveUser) {
+                    currentImmersiveUser = userId;
+                    const user = getUser(userId);
+                    renderImmersiveHeader(user).then(html => {
+                        if (headerContainer) headerContainer.innerHTML = html;
+                    });
+                }
+            } else {
+                // La vidéo n'est plus visible - l'arrêter
+                if (video) {
+                    video.pause();
+                }
+            }
+        });
+    }, {
+        threshold: 0.5 // Trigger when 50% visible
+    });
+    
+    posts.forEach(post => observer.observe(post));
+}
+
+function setupImmersiveVideoUI() {
+    const container = document.getElementById('immersive-content-container');
+    if (!container) return;
+
+    const wraps = container.querySelectorAll('.immersive-video-wrap');
+    wraps.forEach(wrap => {
+        const video = wrap.querySelector('video.immersive-video');
+        const playIcon = wrap.querySelector('.immersive-video-play');
+        if (!video || !playIcon) return;
+
+        const updateOverlay = () => {
+            playIcon.style.display = video.paused ? 'block' : 'none';
+        };
+
+        updateOverlay();
+
+        video.addEventListener('play', updateOverlay);
+        video.addEventListener('pause', updateOverlay);
+        video.addEventListener('ended', updateOverlay);
+        video.addEventListener('loadeddata', () => {
+            wrap.classList.add('is-ready');
+        }, { once: true });
+        video.addEventListener('error', () => {
+            wrap.classList.add('has-error');
+        }, { once: true });
+
+        wrap.addEventListener('click', () => {
+            if (video.paused) {
+                if (!window.__immersiveSoundUnlocked) {
+                    window.__immersiveSoundUnlocked = true;
+                }
+                video.muted = false;
+                video.play().catch(() => {});
+            } else {
+                video.pause();
+            }
+        });
+
+        // Démarrer automatiquement la vidéo quand elle devient visible
+        setupVideoAutoplay(video, wrap);
+    });
+    
+    // Initialiser l'activation globale du son
+    initGlobalSoundActivation();
+}
+
+// Fonction pour démarrer automatiquement les vidéos visibles
+function setupVideoAutoplay(video, container) {
+    // Observer la visibilité de la vidéo
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                // La vidéo est visible - tenter de la jouer
+                video.muted = !window.__immersiveSoundUnlocked;
+                video.play().then(() => {
+                    console.log('Vidéo démarrée automatiquement');
+                }).catch(error => {
+                    console.log('Autoplay bloqué, attente interaction utilisateur:', error);
+                });
+            } else {
+                // La vidéo n'est plus visible - mettre en pause pour économiser les ressources
+                video.pause();
+            }
+        });
+    }, {
+        threshold: 0.5 // Démarrer quand 50% de la vidéo est visible
+    });
+
+    observer.observe(container);
+}
+
+// Activation globale du son pour toutes les vidéos
+function initGlobalSoundActivation() {
+    let soundActivated = false;
+    
+    const activateAllSounds = () => {
+        if (soundActivated) return;
+        soundActivated = true;
+        window.__immersiveSoundUnlocked = true;
+        
+        // Activer le son uniquement pour la vidéo immersive active
+        const allVideos = document.querySelectorAll('video.immersive-video');
+        allVideos.forEach(video => {
+            if (!video.paused) {
+                video.muted = false;
+                video.play().catch(() => {});
+            }
+        });
+        
+        console.log('Son activé pour toutes les vidéos');
+        
+        // Retirer tous les écouteurs
+        document.removeEventListener('click', activateAllSounds, true);
+        document.removeEventListener('keydown', activateAllSounds, true);
+        document.removeEventListener('touchstart', activateAllSounds, true);
+        document.removeEventListener('scroll', activateAllSounds, true);
+        document.removeEventListener('mousemove', activateAllSounds, true);
+    };
+    
+    // Écouter TOUTES les interactions possibles
+    document.addEventListener('click', activateAllSounds, { once: true, capture: true });
+    document.addEventListener('keydown', activateAllSounds, { once: true, capture: true });
+    document.addEventListener('touchstart', activateAllSounds, { once: true, capture: true });
+    document.addEventListener('scroll', activateAllSounds, { once: true, capture: true });
+    document.addEventListener('mousemove', activateAllSounds, { once: true, capture: true });
+    
+    // Ne pas forcer l'activation sans interaction utilisateur
+}
+
+function setupImmersiveSnapNav() {
+    const overlay = document.getElementById('immersive-overlay');
+    if (!overlay) return;
+    if (overlay.dataset.snapNavBound === 'true') return;
+    overlay.dataset.snapNavBound = 'true';
+    let startY = 0;
+    let endY = 0;
+    let isTouching = false;
+
+    const getActiveIndex = (posts) => {
+        let closestIndex = 0;
+        let minDistance = Infinity;
+        posts.forEach((post, index) => {
+            const rect = post.getBoundingClientRect();
+            const distance = Math.abs(rect.top);
+            if (distance < minDistance) {
+                minDistance = distance;
+                closestIndex = index;
+            }
+        });
+        return closestIndex;
+    };
+
+    const scrollToIndex = (posts, index) => {
+        if (!posts[index]) return;
+        posts[index].scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+
+    overlay.addEventListener('touchstart', (e) => {
+        if (!e.touches || e.touches.length === 0) return;
+        startY = e.touches[0].clientY;
+        isTouching = true;
+    }, { passive: true });
+
+    overlay.addEventListener('touchend', (e) => {
+        if (!isTouching) return;
+        endY = e.changedTouches && e.changedTouches[0] ? e.changedTouches[0].clientY : startY;
+        const delta = startY - endY;
+        const posts = Array.from(document.querySelectorAll('.immersive-post'));
+        if (posts.length === 0) return;
+        const currentIndex = getActiveIndex(posts);
+        if (Math.abs(delta) > 50) {
+            const nextIndex = delta > 0 ? currentIndex + 1 : currentIndex - 1;
+            scrollToIndex(posts, Math.max(0, Math.min(posts.length - 1, nextIndex)));
+        }
+        isTouching = false;
+    }, { passive: true });
+}
+
+function setupImmersiveKeyboardNav() {
+    const overlay = document.getElementById('immersive-overlay');
+    if (!overlay) return;
+    if (window.__immersiveKeyboardNavBound) return;
+    window.__immersiveKeyboardNavBound = true;
+
+    const handler = (e) => {
+        if (overlay.style.display !== 'block') return;
+        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+        const posts = Array.from(document.querySelectorAll('.immersive-post'));
+        if (posts.length === 0) return;
+        const currentIndex = (() => {
+            let closestIndex = 0;
+            let minDistance = Infinity;
+            posts.forEach((post, index) => {
+                const rect = post.getBoundingClientRect();
+                const distance = Math.abs(rect.top);
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    closestIndex = index;
+                }
+            });
+            return closestIndex;
+        })();
+        const nextIndex = e.key === 'ArrowDown' ? currentIndex + 1 : currentIndex - 1;
+        const clamped = Math.max(0, Math.min(posts.length - 1, nextIndex));
+        posts[clamped].scrollIntoView({ behavior: 'smooth', block: 'start' });
+        e.preventDefault();
+    };
+
+    document.addEventListener('keydown', handler);
+}
+
+/* ========================================
+   RENDERING - PROFILE TIMELINE
+   ======================================== */
+
+async function renderProfileTimeline(userId) {
+    console.log('renderProfileTimeline appelé pour userId:', userId);
+    console.log('allUsers contient:', allUsers.length, 'utilisateurs');
+    
+    const user = getUser(userId);
+    if (!user) {
+        console.error('Utilisateur non trouvé dans allUsers:', userId);
+        console.log('Liste des IDs dans allUsers:', allUsers.map(u => u.id));
+        return '<p>Utilisateur introuvable</p>';
+    }
+    
+    console.log('Utilisateur trouvé:', user.name);
+    // Récupérer les contenus
+    const contents = getUserContentLocal(userId);
+    const userBadgesHtml = renderUserBadges(userId);
+    
+    // Récupérer les ARCs
+    let userArcs = [];
+    try {
+        const { data } = await supabase
+            .from('arcs')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false });
+        userArcs = data || [];
+    } catch (e) {
+        console.error('Erreur chargement ARCs:', e);
+    }
+
+    // Filtrer les contenus si un ARC est sélectionné
+    let displayContents = contents;
+    let selectedArc = null;
+    
+    if (window.selectedArcId) {
+        displayContents = contents.filter(c => c.arcId === window.selectedArcId);
+        selectedArc = userArcs.find(a => a.id === window.selectedArcId);
+    }
+
+    // Générer HTML des ARCs
+    let arcsHtml = '';
+    if (userArcs.length > 0) {
+        const arcItems = userArcs.map(arc => {
+            const isActive = window.selectedArcId === arc.id;
+            const progress = 0; // Calculer progression si possible
+            return `
+                <div class="arc-card ${isActive ? 'active' : ''}" onclick="selectArc('${arc.id}', '${userId}')" style="min-width: 200px; padding: 1rem; border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; background: ${isActive ? 'rgba(255,255,255,0.05)' : 'transparent'}; transition: all 0.2s;">
+                    <div style="font-weight: 600; margin-bottom: 0.5rem; color: ${isActive ? 'var(--accent-color)' : 'inherit'}">${arc.title}</div>
+                    <div style="font-size: 0.8rem; color: var(--text-secondary);">${arc.status === 'completed' ? 'Terminé' : 'En cours'}</div>
+                    ${isActive ? '<div style="margin-top:0.5rem; font-size:0.75rem; color:var(--accent-color);">Voir les traces</div>' : ''}
+                </div>
+            `;
+        }).join('');
+
+        arcsHtml = `
+            <div class="arcs-section" style="margin: 2rem 0;">
+                <h3 style="margin-bottom: 1rem; display:flex; align-items:center; justify-content:space-between;">
+                    ARCs
+                    ${window.selectedArcId ? `<button onclick="selectArc(null, '${userId}')" style="background:none; border:none; color:var(--text-secondary); font-size:0.8rem; cursor:pointer;">Voir tout</button>` : ''}
+                </h3>
+                <div class="arcs-scroller" style="display: flex; gap: 1rem; overflow-x: auto; padding-bottom: 1rem;">
+                    ${arcItems}
+                </div>
+            </div>
+        `;
+    }
+
+    const currentUserId = window.currentUserId;
+    const isOwnProfile = userId === currentUserId;
+    const isFollowingThisUser = currentUserId && !isOwnProfile ? await isFollowing(currentUserId, userId) : false;
+    
+    // ... Boutons existants ...
+    const settingsButtonHtml = isOwnProfile ? `
+        <button class="badge settings-badge" onclick="window.launchLive('${userId}')" title="Lancer un live">
+            <div class="badge-icon"><img src="icons/live.svg" alt="Live" style="width:100%;height:100%;"></div>
+            <span>Live</span>
+        </button>
+        <button class="badge settings-badge" onclick="window.location.href='analytics.html'" title="Analytics">
+            <div class="badge-icon"><img src="icons/analytics.svg" alt="Analytics" style="width:100%;height:100%;"></div>
+            <span>Analytics</span>
+        </button>
+        <button class="badge settings-badge" onclick="openSettings('${userId}')" title="Réglages">
+            <div class="badge-icon"><img src="icons/reglages.svg" alt="Réglages" style="width:100%;height:100%;"></div>
+            <span>Réglages</span>
+        </button>
+    ` : '';
+    
+    const followButtonHtml = !isOwnProfile && currentUserId ? `
+        <button 
+            class="btn btn-follow ${isFollowingThisUser ? 'unfollow' : ''}"
+            onclick="toggleFollow('${currentUserId}', '${userId}')"
+            id="follow-btn-${userId}"
+            style="background: transparent; border: none; padding: 0;"
+        >
+            <img src="${isFollowingThisUser ? 'icons/subscribed.svg' : 'icons/subscribe.svg'}" class="btn-icon" style="width: 24px; height: 24px;">
+        </button>
+    ` : '';
+    
+    const followerCount = await getFollowerCount(userId);
+    const followingCount = await getFollowingCount(userId);
+    const engagementTotals = await getUserEngagementTotals(userId);
+    const engagementStatsHtml = `
+        <div class="follow-section" style="margin-top: 0.5rem;">
+            <div class="follower-stat">
+                <div class="follower-stat-count">${engagementTotals.totalViews}</div>
+                <div class="follower-stat-label">Vues totales</div>
+            </div>
+            <div class="follower-stat">
+                <div class="follower-stat-count">${engagementTotals.totalEncouragements}</div>
+                <div class="follower-stat-label">Encouragements reçus</div>
+            </div>
+            <div class="follower-stat">
+                <div class="follower-stat-count">${engagementTotals.totalStreamViewers}</div>
+                <div class="follower-stat-label">Viewers de streams</div>
+            </div>
+        </div>
+    `;
+    
+    // Générer la timeline (avec displayContents filtré)
+    const getDayNumberValue = (c) => {
+        if (!c) return 0;
+        return typeof c.dayNumber === 'number' ? c.dayNumber : (typeof c.day_number === 'number' ? c.day_number : 0);
+    };
+    const timeline = [];
+    
+    if (window.selectedArcId && displayContents.length === 0) {
+        // Si ARC sélectionné mais vide
+        timeline.push({
+            dayNumber: 0,
+            content: null,
+            state: 'empty-arc',
+            message: "Aucune trace dans cet ARC pour le moment."
+        });
+    } else if (window.selectedArcId) {
+        // ARC sélectionné: afficher TOUT le contenu de l'ARC, trié par jour décroissant
+        const arcItems = [...displayContents].sort((a, b) => getDayNumberValue(b) - getDayNumberValue(a));
+        arcItems.forEach(content => {
+            timeline.push({
+                dayNumber: getDayNumberValue(content),
+                content,
+                state: content.state
+            });
+        });
+    } else {
+        // Logique normale: timeline complète par jour avec trous
+        const maxDay = displayContents.reduce((max, c) => Math.max(max, getDayNumberValue(c)), 0);
+        for (let day = maxDay; day >= 1; day--) {
+            const dayContent = displayContents.find(c => getDayNumberValue(c) === day);
+            timeline.push({
+                dayNumber: day,
+                content: dayContent || null,
+                state: dayContent ? dayContent.state : 'empty'
+            });
+        }
+    }
+    
+    const timelineItems = timeline.map(item => {
+        if (item.state === 'empty-arc') {
+             return `<div style="text-align:center; padding:2rem; color:var(--text-secondary);">${item.message}</div>`;
+        }
+        if (item.state === 'empty') {
+            const emptyBadgeSvg = `
+                <div class="timeline-dot-badge">
+                    ${badgeSVGs.empty}
+                </div>
+            `;
+            
+            return `
+                <div class="timeline-item item-empty">
+                    ${emptyBadgeSvg}
+                    <div class="timeline-date">Jour ${item.dayNumber}</div>
+                    <div class="timeline-card" style="opacity: 0.5;">
+                        <span class="empty-indicator">Aucune trace aujourd'hui.</span>
+                    </div>
+                </div>
+            `;
+        }
+        
+        const content = item.content;
+        const itemClass = `item-${content.state}`;
+        const dateFormatted = new Intl.DateTimeFormat('fr-FR', { 
+            month: 'long', 
+            day: 'numeric' 
+        }).format(content.createdAt);
+        
+        const timeAgoStr = timeAgo(content.createdAt);
+        const dateDisplay = `${dateFormatted} - Jour ${content.dayNumber} <span style="opacity: 0.5; font-size: 0.85em; margin-left: 8px;">(${timeAgoStr})</span>`;
+        
+        let stateBadgeSvg = '';
+        if (content.state === 'success') {
+            stateBadgeSvg = badgeSVGs.success;
+        } else if (content.state === 'failure') {
+            stateBadgeSvg = badgeSVGs.failure;
+        } else if (content.state === 'pause') {
+            stateBadgeSvg = badgeSVGs.pause;
+        }
+        
+        // Ajouter le média s'il existe
+        let mediaHtml = '';
+        if (content.mediaUrl) {
+            if (content.type === 'video') {
+                mediaHtml = `<div class="timeline-media"><video src="${content.mediaUrl}" controls style="max-width: 100%; border-radius: 8px; margin-top: 1rem;"></video></div>`;
+            } else if (content.type === 'image') {
+                mediaHtml = `<div class="timeline-media"><img src="${content.mediaUrl}" alt="${content.title}" style="max-width: 100%; border-radius: 8px; margin-top: 1rem;"></div>`;
+            } else if (content.type === 'live' || content.type === 'gif') {
+                mediaHtml = `<div class="timeline-media"><a href="${content.mediaUrl}" target="_blank" style="color: var(--accent-color); text-decoration: underline; margin-top: 1rem; display: block;">Voir le média</a></div>`;
+            }
+        }
+
+        // Ajouter les références ARC/Projet
+        let contextHtml = '';
+        const contextItems = [];
+        
+        if (content.arc) {
+            const arcStatusColor = content.arc.status === 'completed' ? '#10b981' : content.arc.status === 'abandoned' ? '#ef4444' : '#f59e0b';
+            contextItems.push(`<span class="context-tag arc-tag" style="background: ${arcStatusColor}20; color: ${arcStatusColor}; border: 1px solid ${arcStatusColor}30;" onclick="openArcDetails('${content.arc.id}')">🎯 ${content.arc.title}</span>`);
+        }
+        
+        if (content.project) {
+            contextItems.push(`<span class="context-tag project-tag" style="background: var(--accent-color)20; color: var(--accent-color); border: 1px solid var(--accent-color)30;">📁 ${content.project.name}</span>`);
+        }
+        
+        if (contextItems.length > 0) {
+            contextHtml = `<div class="timeline-context" style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">${contextItems.join('')}</div>`;
+        }
+
+        // Ajouter boutons de modification/suppression si c'est le profil de l'utilisateur connecté
+        let actionsHtml = '';
+        if (currentUser && currentUser.id === userId) {
+            // Log de débogage pour vérifier l'ID
+            console.log('Content ID pour les boutons:', content.contentId, 'Content complet:', content);
+            
+            actionsHtml = `
+                <div class="timeline-actions" style="margin-top: 0.5rem; display: flex; gap: 0.5rem; opacity: 0.7;">
+                    <button class="btn-action" onclick="editContent('${content.contentId || content.id}')" style="background: none; border: 1px solid var(--border-color); color: var(--text-secondary); padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; cursor: pointer;">
+                        ✏️ Modifier
+                    </button>
+                    <button class="btn-action" onclick="deleteContent('${content.contentId || content.id}')" style="background: none; border: 1px solid #ef4444; color: #ef4444; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; cursor: pointer;">
+                        🗑️ Supprimer
+                    </button>
+                </div>
+            `;
+        }
+
+        return `
+            <div class="timeline-item ${itemClass}">
+                <div class="timeline-dot-badge filled">
+                    ${stateBadgeSvg}
+                </div>
+                <div class="timeline-date">${dateDisplay}</div>
+                <div class="timeline-card">
+                    <h4>${content.title}</h4>
+                    <p>${content.description}</p>
+                    ${contextHtml}
+                    ${mediaHtml}
+                    ${actionsHtml}
+                </div>
+            </div>
+        `;
+    }).join('');
+    
+    const timelineCollapsedHtml = timeline.length > 0 ? `
+        <div class="timeline-latest">
+            <div class="timeline-item-latest">
+                ${(() => {
+                    const lastItem = timeline[0];
+                    if (lastItem.state === 'empty' || lastItem.state === 'empty-arc') {
+                        const message = lastItem.state === 'empty-arc' ? lastItem.message : "Aucune trace aujourd'hui.";
+                        return `
+                            <div class="timeline-dot-badge">
+                                ${badgeSVGs.empty}
+                            </div>
+                            <div class="timeline-date">Jour ${lastItem.dayNumber}</div>
+                            <div class="timeline-card" style="opacity: 0.5;">
+                                <span class="empty-indicator">${message}</span>
+                            </div>
+                        `;
+                    } else {
+                        const content = lastItem.content;
+                        let stateBadgeSvg = '';
+                        if (content.state === 'success') {
+                            stateBadgeSvg = badgeSVGs.success;
+                        } else if (content.state === 'failure') {
+                            stateBadgeSvg = badgeSVGs.failure;
+                        } else if (content.state === 'pause') {
+                            stateBadgeSvg = badgeSVGs.pause;
+                        }
+                        const dateFormatted = new Intl.DateTimeFormat('fr-FR', { 
+                            month: 'long', 
+                            day: 'numeric' 
+                        }).format(content.createdAt);
+                        
+                        const timeAgoStr = timeAgo(content.createdAt);
+                        const dateDisplay = `${dateFormatted} - Jour ${content.dayNumber} <span style="opacity: 0.5; font-size: 0.85em; margin-left: 8px;">(${timeAgoStr})</span>`;
+                        
+                        // Ajouter le média s'il existe pour la vue condensée
+                        let mediaHtmlLatest = '';
+                        if (content.mediaUrl) {
+                            if (content.type === 'video') {
+                                mediaHtmlLatest = `<div class="timeline-media"><video src="${content.mediaUrl}" controls style="max-width: 100%; border-radius: 8px; margin-top: 1rem;"></video></div>`;
+                            } else if (content.type === 'image') {
+                                mediaHtmlLatest = `<div class="timeline-media"><img src="${content.mediaUrl}" alt="${content.title}" style="max-width: 100%; border-radius: 8px; margin-top: 1rem;"></div>`;
+                            } else if (content.type === 'live' || content.type === 'gif') {
+                                mediaHtmlLatest = `<div class="timeline-media"><a href="${content.mediaUrl}" target="_blank" style="color: var(--accent-color); text-decoration: underline; margin-top: 1rem; display: block;">Voir le média</a></div>`;
+                            }
+                        }
+
+                        // Ajouter les références ARC/Projet pour la vue condensée
+                        let contextHtmlLatest = '';
+                        const contextItemsLatest = [];
+                        
+                        if (content.arc) {
+                            const arcStatusColor = content.arc.status === 'completed' ? '#10b981' : content.arc.status === 'abandoned' ? '#ef4444' : '#f59e0b';
+                            contextItemsLatest.push(`<span class="context-tag arc-tag" style="background: ${arcStatusColor}20; color: ${arcStatusColor}; border: 1px solid ${arcStatusColor}30;" onclick="openArcDetails('${content.arc.id}')">🎯 ${content.arc.title}</span>`);
+                        }
+                        
+                        if (content.project) {
+                            contextItemsLatest.push(`<span class="context-tag project-tag" style="background: var(--accent-color)20; color: var(--accent-color); border: 1px solid var(--accent-color)30;">📁 ${content.project.name}</span>`);
+                        }
+                        
+                        if (contextItemsLatest.length > 0) {
+                            contextHtmlLatest = `<div class="timeline-context" style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">${contextItemsLatest.join('')}</div>`;
+                        }
+
+                        return `
+                            <div class="timeline-dot-badge filled">
+                                ${stateBadgeSvg}
+                            </div>
+                            <div class="timeline-date">${dateDisplay}</div>
+                            <div class="timeline-card">
+                                <h4>${content.title}</h4>
+                                <p>${content.description}</p>
+                                ${contextHtmlLatest}
+                                ${mediaHtmlLatest}
+                            </div>
+                        `;
+                    }
+                })()}
+            </div>
+            <button class="btn-toggle-timeline" onclick="toggleTimelineExpand(this)">
+                <span class="toggle-text">Afficher l'historique complet</span>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+            </button>
+            <div class="timeline-full hidden" id="timeline-full-${userId}">
+                ${timelineItems}
+            </div>
+        </div>
+    ` : '';
+    
+    const timelinesHtml = timelineCollapsedHtml;
+    
+    const safeBanner = user.banner && (user.banner.startsWith('http') || user.banner.startsWith('data:')) ? user.banner : null;
+    const bannerHtml = safeBanner ? `<img src="${safeBanner}" class="profile-banner" alt="Bannière de ${user.name}" onerror="this.style.display='none'">` : '';
+    
+    const projects = userProjects[userId] || [];
+    const projectsHtml = projects.length ? `
+        <div class="projects-grid">
+            ${projects.map(p => `
+                <div class="project-card">
+                    <img src="${p.cover || user.banner || user.avatar}" class="project-cover" alt="Cover">
+                    <div class="project-meta">
+                        <h4>${p.name}</h4>
+                        <p>${p.description || ''}</p>
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    ` : '';
+    
+    const profileHtml = `
+        ${bannerHtml}
+        <div class="profile-hero">
+            <div class="profile-avatar-wrapper">
+                <img src="${(user.avatar && (user.avatar.startsWith('http') || user.avatar.startsWith('data:'))) ? user.avatar : 'https://placehold.co/150'}" class="profile-avatar-img" alt="Avatar de ${user.name}" onclick="navigateToUserProfile('${userId}')" style="cursor: pointer;">
+            </div>
+            <h2>${renderUsernameForProfile(user.name, user.id)}</h2>
+            <p style="color: var(--text-secondary);"><strong>${user.title}</strong></p>
+            <p class="profile-bio" style="max-width: 600px; margin: 0.5rem auto; line-height: 1.5;">${user.bio || ''}</p>
+            ${userBadgesHtml}
+            ${renderProfileSocialLinks(userId)}
+            
+            ${!isOwnProfile ? `
+                <div class="follow-section">
+                    <div class="follower-stat">
+                        <div class="follower-stat-count">${followerCount}</div>
+                        <div class="follower-stat-label">Abonnés</div>
+                    </div>
+                    <div class="follower-stat">
+                        <div class="follower-stat-count">${followingCount}</div>
+                        <div class="follower-stat-label">Abonnements</div>
+                    </div>
+                </div>
+                ${engagementStatsHtml}
+                ${followButtonHtml}
+            ` : `
+                <div class="follow-section">
+                    <div class="follower-stat">
+                        <div class="follower-stat-count">${followerCount}</div>
+                        <div class="follower-stat-label">Abonnés</div>
+                    </div>
+                    <div class="follower-stat">
+                        <div class="follower-stat-count">${followingCount}</div>
+                        <div class="follower-stat-label">Abonnements</div>
+                    </div>
+                </div>
+                ${engagementStatsHtml}
+                <div class="profile-actions" style="margin-top:6px; display:flex; gap:8px; align-items:center;"> 
+                    <button class="btn-add" onclick="openCreateMenu('${userId}')" title="Ajouter une trace">
+                        <img src="icons/plus.svg" alt="Ajouter" style="width:18px;height:18px">
+                    </button>
+                    <button class="btn-secondary profile-arc-btn" onclick="window.openCreateModal ? window.openCreateModal() : console.error('openCreateModal function not found')" title="Démarrer un ARC" style="padding: 0.5rem 1rem; border-radius: 12px; font-size: 0.85rem; display: flex; align-items: center; gap: 0.5rem;">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                        Nouvel ARC
+                    </button>
+                    ${settingsButtonHtml}
+                </div>
+            `}
+        </div>
+        ${arcsHtml}
+        ${projectsHtml}
+        <div class="profile-analytics-section ${!isOwnProfile ? 'compact' : ''}" style="margin: 2.5rem 0;">
+            <h3 class="section-title">Analytics mensuelles</h3>
+            <div id="profile-analytics" class="analytics-dashboard ${!isOwnProfile ? 'analytics-dashboard-compact' : ''}" style="padding: 0; margin: 0; max-width: 100%;"></div>
+        </div>
+        <div class="timeline">
+            ${window.selectedArcId && selectedArc ? `<div style="padding: 1rem; background: rgba(255,255,255,0.05); border-radius: 8px; margin-bottom: 1rem; text-align: center;">Affichage des traces pour l'ARC : <strong>${selectedArc.title}</strong></div>` : ''}
+            ${timelinesHtml}
+        </div>
+        
+        <!-- Footer uniquement sur la page profil -->
+        <footer style="background: var(--bg-secondary); border-top: 1px solid var(--border-color); padding: 2rem; margin-top: 4rem; text-align: center;">
+            <div style="max-width: 1200px; margin: 0 auto;">
+                <div style="display: flex; justify-content: center; align-items: center; gap: 2rem; margin-bottom: 1rem; flex-wrap: wrap;">
+                    <a href="index.html" style="color: var(--text-secondary); text-decoration: none; transition: color 0.3s;">Accueil</a>
+                    <a href="credits.html" style="color: var(--text-secondary); text-decoration: none; transition: color 0.3s;">Crédits</a>
+                </div>
+                <p style="color: var(--text-muted); font-size: 0.9rem;">© 2026 RIZE - Documentez l'effort</p>
+            </div>
+        </footer>
+    `;
+    
+    const settingsButtonContainer = document.getElementById('settings-button-container');
+    if (settingsButtonContainer) {
+        settingsButtonContainer.innerHTML = '';
+    }
+    
+    return profileHtml;
+}
+
+async function renderProfileIntoContainer(userId) {
+    window.currentProfileViewed = userId;
+    const profileContainer = document.querySelector('.profile-container');
+    if (!profileContainer) return;
+    profileContainer.innerHTML = await renderProfileTimeline(userId);
+    profileContainer.classList.toggle('arc-view', !!window.selectedArcId);
+    if (window.loadUserArcs) window.loadUserArcs(userId);
+    if (window.renderProfileAnalytics) window.renderProfileAnalytics(userId);
+    maybeShowAmbassadorWelcome(userId);
+}
+
+/* ========================================
+   NAVIGATION
+   ======================================== */
+
+function navigateTo(pageId) {
+    // Vérifier si l'utilisateur essaie d'accéder à son profil sans être connecté
+    if (pageId === 'profile' && !currentUser && !window.currentProfileViewed) {
+        window.location.href = 'login.html';
+        return;
+    }
+    
+    const pages = document.querySelectorAll('.page');
+    pages.forEach(p => p.classList.remove('active'));
+    const targetPage = document.getElementById(pageId);
+    if (targetPage) {
+        targetPage.classList.add('active');
+    }
+    window.scrollTo(0, 0);
+    document.body.classList.toggle('profile-open', pageId === 'profile');
+}
+
+// Make sure handleProfileNavigation is defined as an async function
+async function handleProfileNavigation() {
+    if (!window.currentUser) {
+        // Rediriger vers la page de connexion
+        window.location.href = 'login.html';
+        return;
+    }
+    
+    // Si connecté, naviguer vers le profil
+    navigateTo('profile');
+    
+    // S'assurer que le profil est rendu avec l'utilisateur courant
+    if (window.currentUserId) {
+        await renderProfileIntoContainer(window.currentUserId);
+    }
+}
+
+// Expose the function globally to ensure accessibility
+window.handleProfileNavigation = handleProfileNavigation;
+
+// Select ARC function
+window.selectedArcId = null;
+async function selectArc(arcId, userId) {
+    window.selectedArcId = arcId;
+    await renderProfileIntoContainer(userId);
+}
+window.selectArc = selectArc;
+
+async function navigateToUserProfile(userId) {
+    const profileContainer = document.querySelector('.profile-container');
+    window.currentProfileViewed = userId;
+    if (profileContainer) {
+        profileContainer.innerHTML = `
+            <div style="padding: 2rem; color: var(--text-secondary);">
+                Chargement du profil...
+            </div>
+        `;
+        profileContainer.classList.remove('arc-view');
+    }
+    navigateTo('profile');
+    await renderProfileIntoContainer(userId);
+}
+
+async function handleProfileClick(userId, triggerEl, fromImmersive = false) {
+    if (!userId) return;
+
+    if (triggerEl) {
+        triggerEl.classList.add('click-loading', 'click-loading-indicator');
+    }
+
+    if (fromImmersive && document.getElementById('immersive-overlay')?.style.display === 'block') {
+        closeImmersive();
+        await new Promise(resolve => setTimeout(resolve, 60));
+    }
+
+    await navigateToUserProfile(userId);
+
+    if (triggerEl && triggerEl.isConnected) {
+        triggerEl.classList.remove('click-loading', 'click-loading-indicator');
+    }
+}
+
+/* ========================================
+   UTILITAIRES UI
+   ======================================== */
+
+function toggleTimelineExpand(button) {
+    const timelineLatest = button.closest('.timeline-latest');
+    const timelineFull = timelineLatest.querySelector('.timeline-full');
+    const toggleText = button.querySelector('.toggle-text');
+    const isExpanded = !timelineFull.classList.contains('hidden');
+    
+    if (isExpanded) {
+        timelineFull.classList.add('hidden');
+        toggleText.textContent = 'Afficher l\'historique complet';
+        button.classList.remove('expanded');
+    } else {
+        timelineFull.classList.remove('hidden');
+        toggleText.textContent = 'Masquer l\'historique';
+        button.classList.add('expanded');
+    }
+}
+
+function toggleVideoPlay(video) {
+    if (video.paused) {
+        video.play().catch(() => {});
+    } else {
+        video.pause();
+    }
+}
+
+function setupDiscoverVideoInteractions() {
+    const videos = document.querySelectorAll('video.card-media');
+    
+    // Intersection Observer for Auto-play
+    const observerOptions = {
+        root: null,
+        rootMargin: '0px',
+        threshold: 0.6 // Play when 60% visible
+    };
+    
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            const video = entry.target;
+            
+            if (entry.isIntersecting) {
+                // Play if visible - keep muted for cards
+                video.muted = true;
+                video.play().catch(() => {
+                    console.log('Autoplay blocked for card video');
+                });
+            } else {
+                // Pause if not visible
+                video.pause();
+            }
+        });
+    }, observerOptions);
+    
+    videos.forEach(video => {
+        const wrap = video.closest('.card-media-wrap');
+        // Initial setup - ensure muted for cards
+        video.muted = true;
+        video.playsInline = true;
+        
+        // Mark as ready when metadata is loaded
+        const markReady = () => {
+            if (wrap) wrap.classList.add('is-ready');
+        };
+        video.addEventListener('loadeddata', markReady, { once: true });
+        video.addEventListener('error', () => {
+            if (wrap) wrap.classList.add('has-error');
+        }, { once: true });
+
+        // Start observing
+        observer.observe(video);
+        
+        // Autoplay on hover for discover cards
+        video.addEventListener('mouseenter', function() {
+            this.muted = true;
+            this.play().catch(() => {});
+        });
+        video.addEventListener('mouseleave', function() {
+            this.pause();
+        });
+        
+        // Let clicks bubble to the card to open immersive
+        video.addEventListener('click', function() {});
+        video.addEventListener('touchstart', function() {});
+        
+        // Prevent default video controls from interfering
+        video.addEventListener('contextmenu', (e) => e.preventDefault());
+        
+        // Force muted state on any volume change attempts
+        video.addEventListener('volumechange', () => {
+            if (!video.muted) {
+                video.muted = true;
+                console.log('Forced card video to stay muted');
+            }
+        });
+    });
+}
+
+/* ========================================
+   SYSTÈME DE THÈME
+   ======================================== */
+
+function initTheme() {
+    const savedTheme = localStorage.getItem('rize-theme');
+    if (savedTheme === 'light') {
+        document.documentElement.classList.add('light-mode');
+    }
+}
+
+function toggleTheme() {
+    const htmlElement = document.documentElement;
+    htmlElement.classList.toggle('light-mode');
+    
+    if (htmlElement.classList.contains('light-mode')) {
+        localStorage.setItem('rize-theme', 'light');
+    } else {
+        localStorage.setItem('rize-theme', 'dark');
+    }
+}
+
+function isLightMode() {
+    return document.documentElement.classList.contains('light-mode');
+}
+
+/* ========================================
+   RÉGLAGES
+   ======================================== */
+
+function closeSettings() {
+    const modal = document.getElementById('settings-modal');
+    modal.classList.remove('active');
+    setTimeout(() => {
+        modal.style.display = 'none';
+    }, 300);
+}
+
+async function openSettings(userId) {
+    if (!currentUser || currentUser.id !== userId) return;
+
+    const user = getUser(userId);
+    const modal = document.getElementById('settings-modal');
+    const container = modal.querySelector('.settings-container');
+
+    const followerCount = await getFollowerCount(userId);
+    const accountType = user.account_type || 'personal';
+    const isEnterprise = accountType === 'enterprise' || accountType === 'team';
+    const isCreatorVerified = isVerifiedCreatorUserId(userId);
+    const isStaffVerified = isVerifiedStaffUserId(userId);
+    const isCreatorEligible = followerCount >= 1000;
+    const pendingTypes = await fetchUserPendingRequests(userId);
+    const creatorRequestPending = pendingTypes.has('creator');
+    const staffRequestPending = pendingTypes.has('staff');
+    const pendingRequests = isVerificationAdmin() ? await fetchVerificationRequests() : [];
+
+    const verificationStatusHtml = isStaffVerified
+        ? `<div class="verification-status verified">Entreprise vérifiée</div>`
+        : isCreatorVerified
+            ? `<div class="verification-status verified">Utilisateur vérifié</div>`
+            : '';
+
+    const creatorRequestHtml = !isCreatorVerified && !isEnterprise ? `
+        ${creatorRequestPending
+            ? `<div class="verification-status pending">Demande envoyée</div>`
+            : isCreatorEligible
+                ? `<button type="button" class="btn-verify" onclick="requestVerification('creator')">Demander vérification</button>`
+                : `<div class="verification-status disabled">Disponible à 1000 abonnés (actuel: ${followerCount})</div>`
+        }
+    ` : '';
+
+    const staffRequestHtml = !isStaffVerified && isEnterprise ? `
+        ${staffRequestPending
+            ? `<div class="verification-status pending">Demande envoyée</div>`
+            : `<button type="button" class="btn-verify" onclick="requestVerification('staff')">Demander vérification équipe</button>`
+        }
+    ` : '';
+
+    const adminRequestsHtml = pendingRequests.length
+        ? pendingRequests.map(req => {
+            const reqUser = getUser(req.userId);
+            const label = req.type === 'staff' ? 'Équipe/Entreprise' : 'Créateur';
+            const avatar = reqUser?.avatar || 'https://placehold.co/40';
+            const name = reqUser?.name || 'Utilisateur';
+            const nameHtml = renderUsernameWithBadge(name, req.userId);
+            return `
+                <label class="verification-request-item">
+                    <input type="checkbox" class="verification-request-check" data-user-id="${req.userId}" data-type="${req.type}">
+                    <img src="${avatar}" alt="${name}">
+                    <span class="verification-request-name">${nameHtml}</span>
+                    <span class="verification-request-type">${label}</span>
+                    <span class="verification-request-id">${req.userId}</span>
+                </label>
+            `;
+        }).join('')
+        : `<div class="verification-empty">Aucune demande en attente.</div>`;
+
+    const verificationAdminHtml = isVerificationAdmin() ? `
+        <div class="settings-section">
+            <h3>Administration vérification</h3>
+            <div class="verification-admin-block">
+                <div class="verification-requests">
+                    ${adminRequestsHtml}
+                </div>
+                <div class="verification-actions">
+                    <button type="button" class="btn-verify" onclick="handleVerificationSelection('approve')">Valider la sélection</button>
+                    <button type="button" class="btn-cancel" onclick="handleVerificationSelection('reject')">Refuser la sélection</button>
+                </div>
+            </div>
+
+            <div class="verification-manual">
+                <h4>Ajouter un créateur vérifié</h4>
+                <div class="verification-input-row">
+                    <input type="text" id="verify-creator-id" class="form-input" placeholder="ID utilisateur">
+                    <button type="button" class="btn-verify" onclick="addVerifiedUserId('creator', document.getElementById('verify-creator-id').value)">Ajouter</button>
+                </div>
+            </div>
+
+            <div class="verification-manual">
+                <h4>Ajouter une équipe vérifiée</h4>
+                <div class="verification-input-row">
+                    <input type="text" id="verify-staff-id" class="form-input" placeholder="ID utilisateur">
+                    <button type="button" class="btn-verify" onclick="addVerifiedUserId('staff', document.getElementById('verify-staff-id').value)">Ajouter</button>
+                </div>
+            </div>
+        </div>
+    ` : '';
+
+    const superAdminHtml = isSuperAdmin() ? `
+        <div class="settings-section">
+            <h3>Super admin</h3>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">Accès total : modération, suppression et annonces officielles.</p>
+
+            <div class="verification-admin-block">
+                <h4>Ban utilisateur (temporaire)</h4>
+                <div class="verification-input-row">
+                    <input type="text" id="admin-ban-user-id" class="form-input" placeholder="ID utilisateur">
+                    <input type="number" id="admin-ban-duration" class="form-input" placeholder="Durée" min="1" value="24">
+                    <select id="admin-ban-unit" class="form-input">
+                        <option value="hours">heures</option>
+                        <option value="days">jours</option>
+                    </select>
+                    <button type="button" class="btn-verify" onclick="
+                        const uid = document.getElementById('admin-ban-user-id').value;
+                        const value = parseInt(document.getElementById('admin-ban-duration').value, 10) || 1;
+                        const unit = document.getElementById('admin-ban-unit').value;
+                        const hours = unit === 'days' ? value * 24 : value;
+                        const reason = document.getElementById('admin-ban-reason').value;
+                        banUserByAdmin(uid, hours, reason);
+                    ">Bannir</button>
+                </div>
+                <div class="verification-input-row">
+                    <input type="text" id="admin-ban-reason" class="form-input" placeholder="Raison (optionnel)">
+                    <button type="button" class="btn-cancel" onclick="
+                        const uid = document.getElementById('admin-ban-user-id').value;
+                        unbanUserByAdmin(uid);
+                    ">Lever le ban</button>
+                    <button type="button" class="btn-cancel" onclick="
+                        const uid = document.getElementById('admin-ban-user-id').value;
+                        hardDeleteUserByAdmin(uid);
+                    ">Supprimer utilisateur</button>
+                </div>
+            </div>
+
+            <div class="verification-admin-block" style="margin-top: 1.5rem;">
+                <h4>Modération contenu</h4>
+                <div class="verification-input-row">
+                    <input type="text" id="admin-content-id" class="form-input" placeholder="ID contenu">
+                    <input type="text" id="admin-content-reason" class="form-input" placeholder="Raison (optionnel)">
+                    <button type="button" class="btn-verify" onclick="
+                        const cid = document.getElementById('admin-content-id').value;
+                        const reason = document.getElementById('admin-content-reason').value;
+                        softDeleteContentByAdmin(cid, reason);
+                    ">Masquer</button>
+                </div>
+                <div class="verification-input-row">
+                    <button type="button" class="btn-cancel" onclick="
+                        const cid = document.getElementById('admin-content-id').value;
+                        restoreContentByAdmin(cid);
+                    ">Restaurer</button>
+                    <button type="button" class="btn-cancel" onclick="
+                        const cid = document.getElementById('admin-content-id').value;
+                        hardDeleteContentByAdmin(cid);
+                    ">Supprimer définitivement</button>
+                </div>
+            </div>
+
+            <div class="verification-admin-block" style="margin-top: 1.5rem;">
+                <h4>Annonce officielle</h4>
+                <div class="verification-input-row" style="flex-direction: column; align-items: stretch;">
+                    <input type="text" id="admin-announcement-title" class="form-input" placeholder="Titre de l'annonce">
+                    <textarea id="admin-announcement-body" class="form-input" rows="3" placeholder="Contenu de l'annonce"></textarea>
+                    <label style="display:flex; align-items:center; gap:0.5rem; color: var(--text-secondary); font-size: 0.9rem;">
+                        <input type="checkbox" id="admin-announcement-pin"> Épingler
+                    </label>
+                    <button type="button" class="btn-verify" onclick="
+                        const title = document.getElementById('admin-announcement-title').value;
+                        const body = document.getElementById('admin-announcement-body').value;
+                        const pin = document.getElementById('admin-announcement-pin').checked;
+                        createAdminAnnouncement({ title, body, isPinned: pin });
+                        document.getElementById('admin-announcement-title').value = '';
+                        document.getElementById('admin-announcement-body').value = '';
+                        document.getElementById('admin-announcement-pin').checked = false;
+                    ">Publier</button>
+                </div>
+            </div>
+        </div>
+    ` : '';
+    
+    // Social links preparation
+    const socialLinks = user.social_links || user.socialLinks || {};
+    
+    container.innerHTML = `
+        <div class="settings-section">
+            <div class="settings-header" style="border:none; margin-bottom:1rem; padding-bottom:0;">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap: 1rem; flex-wrap: wrap;">
+                    <div style="display:flex; align-items:center; gap: 0.75rem;">
+                        <h2>Réglages</h2>
+                        ${isSuperAdmin() ? `<span class="admin-badge">Super admin</span>` : (isVerificationAdmin() ? `<span class="admin-badge">Admin mode</span>` : '')}
+                    </div>
+                    <button type="button" class="btn-theme-toggle" onclick="toggleTheme()" style="width:auto;">
+                        ${isLightMode() ? '🌙 Mode Sombre' : '☀️ Mode Clair'}
+                    </button>
+                </div>
+                <p>Personnalisez votre profil public</p>
+            </div>
+            
+            <!-- Section Crédits -->
+            <div style="margin-bottom: 2rem; padding: 1.5rem; background: rgba(59, 130, 246, 0.1); border-radius: 12px; border: 1px solid rgba(59, 130, 246, 0.2);">
+                <h3 style="margin-bottom: 0.5rem; color: var(--accent-color);">À propos</h3>
+                <p style="margin-bottom: 1rem; color: var(--text-secondary); font-size: 0.9rem;">Découvrez l'histoire derrière RIZE</p>
+                <button type="button" class="settings-credits-btn" onclick="window.location.href='credits.html'" style="background: var(--accent-color); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
+                    Voir les crédits
+                </button>
+            </div>
+            
+            <form id="settings-form">
+                <h3>Identité</h3>
+                
+            <div class="upload-section" style="display: flex; flex-direction: column; gap: 2rem; margin-bottom: 2rem;">
+                <!-- Avatar Section -->
+                <div style="display: flex; flex-direction: column; align-items: center;">
+                    <label class="form-hint" style="margin-bottom:0.5rem; display:block;">Avatar</label>
+                    <div style="position: relative; cursor: pointer;" onclick="document.getElementById('setting-avatar-file').click()">
+                        <img src="${(user.avatar && user.avatar.startsWith('http')) ? user.avatar : 'https://placehold.co/150'}" class="preview-avatar-circle" id="preview-avatar" alt="Avatar" style="object-fit: cover;">
+                        <div style="position: absolute; bottom: 0; right: 0; background: #fff; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 10px rgba(0,0,0,0.5);">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#000" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+                        </div>
+                    </div>
+                    <input type="file" id="setting-avatar-file" accept="image/*" style="display: none;">
+                    <input type="hidden" id="setting-avatar" value="${user.avatar || ''}">
+                    <p style="font-size: 0.8rem; color: #666; margin-top: 0.5rem;">Cliquez pour changer</p>
+                </div>
+
+                <!-- Banner Section -->
+                <div>
+                    <label class="form-hint" style="margin-bottom:0.5rem; display:block;">Bannière</label>
+                    <div style="position: relative; cursor: pointer;" onclick="document.getElementById('setting-banner-file').click()">
+                        <img src="${(user.banner && user.banner.startsWith('http')) ? user.banner : 'https://placehold.co/1200x300/1a1a2e/00ff88?text=Ma+Trajectoire'}" class="preview-banner-rect" id="preview-banner" alt="Bannière" style="object-fit: cover;">
+                        <div style="position: absolute; inset: 0; background: rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.2s; border-radius: 14px;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0">
+                            <span style="background: rgba(0,0,0,0.6); color: white; padding: 0.5rem 1rem; border-radius: 20px; font-size: 0.9rem;">Changer la bannière</span>
+                        </div>
+                    </div>
+                    <input type="file" id="setting-banner-file" accept="image/*" style="display: none;">
+                    <input type="hidden" id="setting-banner" value="${user.banner || ''}">
+                </div>
+            </div>
+
+                <div class="form-group">
+                    <label>Nom d'affichage</label>
+                    <input type="text" id="setting-name" class="form-input" value="${user.name}" required>
+                </div>
+
+                <div class="form-group">
+                    <label>Titre / Rôle</label>
+                    <input type="text" id="setting-title" class="form-input" value="${user.title}" required>
+                </div>
+
+                <div class="form-group">
+                    <label>Bio</label>
+                    <textarea id="setting-bio" class="form-input" rows="4">${user.bio || ''}</textarea>
+                </div>
+
+                <h3>Type de compte</h3>
+                <div class="account-type-toggle">
+                    <button type="button" class="account-type-btn ${!isEnterprise ? 'active' : ''}" data-type="personal">Personnel</button>
+                    <button type="button" class="account-type-btn ${isEnterprise ? 'active' : ''}" data-type="enterprise">Équipe / Entreprise</button>
+                </div>
+                <input type="hidden" id="setting-account-type" value="${isEnterprise ? 'enterprise' : 'personal'}">
+
+                <h3>Vérification</h3>
+                <div class="verification-section">
+                    ${verificationStatusHtml}
+                    ${creatorRequestHtml}
+                    ${staffRequestHtml}
+                </div>
+
+                <h3>Réseaux Sociaux</h3>
+                <div class="form-group">
+                    <div class="social-link-item">
+                        <img src="icons/email.svg" alt="Email">
+                        <input type="email" class="form-input" data-social="email" placeholder="email@exemple.com" value="${socialLinks.email || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/twitter.svg" alt="X">
+                        <input type="text" class="form-input" data-social="twitter" placeholder="x (twitter).com/username" value="${socialLinks.twitter || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/youtube.svg" alt="YouTube">
+                        <input type="text" class="form-input" data-social="youtube" placeholder="https://youtube.com" value="${socialLinks.youtube || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/twitch.svg" alt="Twitch">
+                        <input type="text" class="form-input" data-social="twitch" placeholder="twitch.com/username" value="${socialLinks.twitch || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/spotify.svg" alt="Spotify">
+                        <input type="text" class="form-input" data-social="spotify" placeholder="spotify.com/username" value="${socialLinks.spotify || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/tiktok.svg" alt="TikTok">
+                        <input type="text" class="form-input" data-social="tiktok" placeholder="tiktok.com/username" value="${socialLinks.tiktok || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/discord.svg" alt="Discord">
+                        <input type="text" class="form-input" data-social="discord" placeholder="discord.com/username" value="${socialLinks.discord || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/reddit.svg" alt="Reddit">
+                        <input type="text" class="form-input" data-social="reddit" placeholder="reddit.com/username" value="${socialLinks.reddit || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/pinterest.svg" alt="Pinterest">
+                        <input type="text" class="form-input" data-social="pinterest" placeholder="pinterest.com/username" value="${socialLinks.pinterest || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/linkedin.svg" alt="LinkedIn">
+                        <input type="text" class="form-input" data-social="linkedin" placeholder="linkedin.com/username" value="${socialLinks.linkedin || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/facebook.svg" alt="Facebook">
+                        <input type="text" class="form-input" data-social="facebook" placeholder="facebook.com/username" value="${socialLinks.facebook || ''}">
+                    </div>
+                    <div class="social-link-item">
+                        <img src="icons/link.svg" alt="Site">
+                        <input type="text" class="form-input" data-social="site" placeholder="https://example.com" value="${socialLinks.site || ''}">
+                    </div>
+                </div>
+
+                <div class="actions-bar" style="display: flex; justify-content: flex-end; gap: 1rem; margin-top: 2rem;">
+                    <button type="button" class="btn-cancel" onclick="closeSettings()">Annuler</button>
+                    <button type="submit" class="btn-save">Enregistrer</button>
+                </div>
+
+                <div style="margin-top: 3rem; border-top: 1px solid #1a1a1a; padding-top: 2rem;">
+                     <button type="button" onclick="handleSignOut()" style="width: 100%; padding: 0.8rem; background: #221a1a; color: #ef4444; border: 1px solid #3d1a1a; border-radius: 8px; cursor: pointer; font-weight: 600; transition: all 0.2s;">
+                        Se déconnecter
+                    </button>
+                </div>
+            </form>
+            ${verificationAdminHtml}
+            ${superAdminHtml}
+        </div>
+    `;
+
+    modal.style.display = 'block';
+    // Force reflow
+    modal.offsetHeight;
+    modal.classList.add('active');
+
+    const accountButtons = container.querySelectorAll('.account-type-btn');
+    accountButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            accountButtons.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            document.getElementById('setting-account-type').value = btn.dataset.type;
+        });
+    });
+
+    // Handle form submission
+    document.getElementById('settings-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        const btnSave = e.target.querySelector('.btn-save');
+        const originalText = btnSave.textContent;
+        btnSave.disabled = true;
+        btnSave.textContent = 'Enregistrement...';
+
+        const socialInputs = e.target.querySelectorAll('[data-social]');
+        const newSocialLinks = {};
+        socialInputs.forEach(input => {
+            if (input.value.trim()) {
+                newSocialLinks[input.dataset.social] = normalizeExternalUrl(input.value);
+            }
+        });
+
+        const profileData = {
+            name: document.getElementById('setting-name').value,
+            title: document.getElementById('setting-title').value,
+            bio: document.getElementById('setting-bio').value,
+            avatar: document.getElementById('setting-avatar').value,
+            banner: document.getElementById('setting-banner').value,
+            socialLinks: newSocialLinks,
+            account_type: document.getElementById('setting-account-type').value
+        };
+
+        const result = await upsertUserProfile(userId, profileData);
+        
+        if (result.success) {
+            // Update local state
+            const userIndex = allUsers.findIndex(u => u.id === userId);
+            if (userIndex !== -1) {
+                // Merge new data
+                allUsers[userIndex] = { ...allUsers[userIndex], ...result.data };
+            }
+            
+            // Reload profile view
+            if (document.querySelector('#profile.active')) {
+                await renderProfileIntoContainer(userId);
+            }
+            
+            // Update User Card in Discover Grid if present
+            const userCard = document.querySelector(`.user-card[data-user="${userId}"]`);
+            if (userCard) {
+                userCard.outerHTML = renderUserCard(userId);
+            }
+            
+            closeSettings();
+        } else {
+            alert('Erreur: ' + result.error);
+        }
+        
+        btnSave.disabled = false;
+        btnSave.textContent = originalText;
+    });
+
+    // Initialize file uploads
+    if (typeof initializeFileInput === 'function') {
+        // Avatar upload
+        initializeFileInput('setting-avatar-file', {
+            preview: 'preview-avatar',
+            compress: true,
+            validate: (file) => {
+                if (file.type !== 'image/gif') return { valid: true };
+                if (isCurrentUserVerified()) return { valid: true };
+                return { valid: false, error: 'Vous devez être vérifié pour utiliser un GIF en profil.' };
+            },
+            onUpload: (result) => {
+                if (result.success) {
+                    document.getElementById('setting-avatar').value = result.url;
+                } else {
+                    alert('Erreur upload: ' + result.error);
+                }
+            }
+        });
+
+        // Banner upload
+        initializeFileInput('setting-banner-file', {
+            preview: 'preview-banner',
+            compress: true,
+            validate: (file) => {
+                if (file.type !== 'image/gif') return { valid: true };
+                if (isCurrentUserVerified()) return { valid: true };
+                return { valid: false, error: 'Vous devez être vérifié pour utiliser un GIF en profil.' };
+            },
+            onUpload: (result) => {
+                if (result.success) {
+                    document.getElementById('setting-banner').value = result.url;
+                } else {
+                    alert('Erreur upload: ' + result.error);
+                }
+            }
+        });
+    }
+}
+
+/* ========================================
+   LIVE STREAMING
+   ======================================== */
+
+let currentStream = null;
+let screenStream = null;
+let cameraStream = null;
+let isLive = false;
+
+// Polyfill pour roundRect si non supporté
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+    CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+        this.beginPath();
+        this.moveTo(x + r, y);
+        this.lineTo(x + w - r, y);
+        this.quadraticCurveTo(x + w, y, x + w, y + r);
+        this.lineTo(x + w, y + h - r);
+        this.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        this.lineTo(x + r, y + h);
+        this.quadraticCurveTo(x, y + h, x, y + h - r);
+        this.lineTo(x, y + r);
+        this.quadraticCurveTo(x, y, x + r, y);
+        this.closePath();
+        return this;
+    };
+}
+
+function launchLive(userId) {
+    if (!window.currentUser) {
+        if (window.ToastManager) {
+            ToastManager.error('Connexion requise', 'Vous devez être connecté pour lancer un live');
+        }
+        return;
+    }
+    
+    if (window.currentUser.id !== userId) {
+        if (window.ToastManager) {
+            ToastManager.error('Erreur', 'Vous ne pouvez lancer un live que pour votre propre profil');
+        }
+        return;
+    }
+    
+    // Redirection vers la page de création de stream
+    if (window.ToastManager) {
+        ToastManager.success('Lancement Live', 'Redirection vers la configuration du live...');
+    }
+    
+    setTimeout(() => {
+        window.location.href = 'create-stream.html';
+    }, 500);
+}
+
+// Exposer les fonctions globalement pour les onclick
+window.launchLive = launchLive;
+window.createLiveModal = createLiveModal;
+window.closeLiveModal = closeLiveModal;
+window.toggleCamera = toggleCamera;
+window.toggleScreenShare = toggleScreenShare;
+window.setLayout = setLayout;
+window.updateCameraSize = updateCameraSize;
+window.updateCameraPosition = updateCameraPosition;
+window.startLiveStream = startLiveStream;
+window.stopLiveStream = stopLiveStream;
+
+function createLiveModal() {
+    const modal = document.createElement('div');
+    modal.id = 'live-modal';
+    modal.className = 'modal';
+    modal.innerHTML = `
+        <div class="modal-content live-modal-content">
+            <div class="modal-header">
+                <h2><img src="icons/live.svg" alt="Live" style="width:20px;height:20px;vertical-align:middle;margin-right:8px;filter:invert(0.2);"> Configuration Live Stream</h2>
+                <button class="close-btn" onclick="closeLiveModal()">&times;</button>
+            </div>
+            <div class="live-controls">
+                <div class="stream-preview">
+                    <video id="live-preview" autoplay muted playsinline></video>
+                    <div class="stream-status" id="stream-status">
+                        <span class="status-indicator offline">● Hors ligne</span>
+                    </div>
+                </div>
+                
+                <div class="control-panel">
+                    <div class="source-controls">
+                        <h3>Sources de streaming</h3>
+                        <div class="source-buttons">
+                            <button class="source-btn" id="camera-btn" onclick="toggleCamera()">
+                                📹 Caméra
+                            </button>
+                            <button class="source-btn" id="screen-btn" onclick="toggleScreenShare()">
+                                🖥️ Écran
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="layout-controls" id="layout-controls" style="display: none;">
+                        <h3>Mise en page</h3>
+                        <div class="layout-options">
+                            <button class="layout-btn active" onclick="setLayout('single')">Simple</button>
+                            <button class="layout-btn" onclick="setLayout('pip')">Incrustation</button>
+                            <button class="layout-btn" onclick="setLayout('side')">Côte à côte</button>
+                        </div>
+                        
+                        <div class="size-controls" id="size-controls">
+                            <div class="size-control">
+                                <label>Taille caméra (%)</label>
+                                <input type="range" id="camera-size" min="20" max="80" value="30" onchange="updateCameraSize(this.value)">
+                                <span id="camera-size-value">30%</span>
+                            </div>
+                            <div class="size-control">
+                                <label>Position caméra</label>
+                                <select id="camera-position" onchange="updateCameraPosition(this.value)">
+                                    <option value="bottom-right">Bas droite</option>
+                                    <option value="bottom-left">Bas gauche</option>
+                                    <option value="top-right">Haut droite</option>
+                                    <option value="top-left">Haut gauche</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="stream-actions">
+                        <button class="btn-start-stream" id="start-stream-btn" onclick="startLiveStream()" disabled>
+                            ▶️ Démarrer le live
+                        </button>
+                        <button class="btn-stop-stream" id="stop-stream-btn" onclick="stopLiveStream()" style="display: none;">
+                            ⏹️ Arrêter le live
+                        </button>
+                    </div>
+                    
+                    <div class="stream-info">
+                        <div class="info-item">
+                            <label>Titre du live</label>
+                            <input type="text" id="stream-title" placeholder="Mon super live stream!" maxlength="100">
+                        </div>
+                        <div class="info-item">
+                            <label>Description</label>
+                            <textarea id="stream-description" placeholder="Décrivez votre live..." maxlength="500"></textarea>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    return modal;
+}
+
+function closeLiveModal() {
+    const modal = document.getElementById('live-modal');
+    modal.classList.remove('active');
+    document.body.style.overflow = '';
+    setTimeout(() => {
+        modal.style.display = 'none';
+        // Nettoyer les streams si en cours
+        if (cameraStream) {
+            cameraStream.getTracks().forEach(track => track.stop());
+            cameraStream = null;
+        }
+        if (screenStream) {
+            screenStream.getTracks().forEach(track => track.stop());
+            screenStream = null;
+        }
+    }, 300);
+}
+
+async function toggleCamera() {
+    const btn = document.getElementById('camera-btn');
+    const preview = document.getElementById('live-preview');
+    
+    if (cameraStream) {
+        // Arrêter la caméra
+        cameraStream.getTracks().forEach(track => track.stop());
+        cameraStream = null;
+        btn.classList.remove('active');
+        btn.textContent = '📹 Caméra';
+        updatePreview();
+    } else {
+        // Démarrer la caméra
+        try {
+            cameraStream = await navigator.mediaDevices.getUserMedia({
+                video: { 
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 },
+                    facingMode: 'user'
+                },
+                audio: true
+            });
+            btn.classList.add('active');
+            btn.textContent = '📹 Caméra (ON)';
+            updatePreview();
+            checkStreamReady();
+        } catch (error) {
+            console.error('Erreur caméra:', error);
+            alert('Impossible d\'accéder à la caméra. Vérifiez les permissions.');
+        }
+    }
+}
+
+async function toggleScreenShare() {
+    const btn = document.getElementById('screen-btn');
+    const preview = document.getElementById('live-preview');
+    
+    if (screenStream) {
+        // Arrêter le partage d'écran
+        screenStream.getTracks().forEach(track => track.stop());
+        screenStream = null;
+        btn.classList.remove('active');
+        btn.textContent = '🖥️ Écran';
+        updatePreview();
+    } else {
+        // Démarrer le partage d'écran
+        try {
+            screenStream = await navigator.mediaDevices.getDisplayMedia({
+                video: {
+                    width: { ideal: 1920 },
+                    height: { ideal: 1080 }
+                },
+                audio: true
+            });
+            
+            // Écouter l'arrêt du partage d'écran par l'utilisateur
+            screenStream.getVideoTracks()[0].onended = () => {
+                screenStream = null;
+                btn.classList.remove('active');
+                btn.textContent = '🖥️ Écran';
+                updatePreview();
+                checkStreamReady();
+            };
+            
+            btn.classList.add('active');
+            btn.textContent = '🖥️ Écran (ON)';
+            updatePreview();
+            checkStreamReady();
+        } catch (error) {
+            console.error('Erreur partage d\'écran:', error);
+            alert('Impossible de partager l\'écran. Opération annulée par l\'utilisateur.');
+        }
+    }
+}
+
+function updatePreview() {
+    const preview = document.getElementById('live-preview');
+    const layoutControls = document.getElementById('layout-controls');
+    
+    if (screenStream && cameraStream) {
+        // Mode mixte - afficher les contrôles de layout
+        layoutControls.style.display = 'block';
+        setLayout(document.querySelector('.layout-btn.active')?.onclick?.toString().match(/setLayout\('(.+)'\)/)?.[1] || 'pip');
+    } else if (screenStream) {
+        // Écran seulement
+        preview.srcObject = screenStream;
+        layoutControls.style.display = 'none';
+    } else if (cameraStream) {
+        // Caméra seulement
+        preview.srcObject = cameraStream;
+        layoutControls.style.display = 'none';
+    } else {
+        // Aucun stream
+        preview.srcObject = null;
+        layoutControls.style.display = 'none';
+    }
+}
+
+function setLayout(layout) {
+    // Retirer la classe active de tous les boutons
+    document.querySelectorAll('.layout-btn').forEach(btn => btn.classList.remove('active'));
+    // Ajouter la classe active au bouton sélectionné
+    event.target.classList.add('active');
+    
+    const preview = document.getElementById('live-preview');
+    const sizeControls = document.getElementById('size-controls');
+    
+    if (!screenStream || !cameraStream) return;
+    
+    // Créer un canvas pour mixer les streams
+    const canvas = document.createElement('canvas');
+    canvas.width = 1920;
+    canvas.height = 1080;
+    const ctx = canvas.getContext('2d');
+    
+    const screenVideo = document.createElement('video');
+    const cameraVideo = document.createElement('video');
+    
+    screenVideo.srcObject = screenStream;
+    cameraVideo.srcObject = cameraStream;
+    
+    screenVideo.muted = true;
+    cameraVideo.muted = true;
+    
+    Promise.all([
+        new Promise(resolve => screenVideo.onloadedmetadata = resolve),
+        new Promise(resolve => cameraVideo.onloadedmetadata = resolve)
+    ]).then(() => {
+        screenVideo.play();
+        cameraVideo.play();
+        
+        function drawFrame() {
+            if (layout === 'single') {
+                // Écran seulement
+                ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+                sizeControls.style.display = 'none';
+            } else if (layout === 'pip') {
+                // Picture-in-picture
+                const cameraSize = parseInt(document.getElementById('camera-size').value);
+                const cameraWidth = (canvas.width * cameraSize) / 100;
+                const cameraHeight = (cameraWidth * 9) / 16; // Ratio 16:9
+                
+                const position = document.getElementById('camera-position').value;
+                let x, y;
+                
+                switch (position) {
+                    case 'bottom-right':
+                        x = canvas.width - cameraWidth - 20;
+                        y = canvas.height - cameraHeight - 20;
+                        break;
+                    case 'bottom-left':
+                        x = 20;
+                        y = canvas.height - cameraHeight - 20;
+                        break;
+                    case 'top-right':
+                        x = canvas.width - cameraWidth - 20;
+                        y = 20;
+                        break;
+                    case 'top-left':
+                        x = 20;
+                        y = 20;
+                        break;
+                }
+                
+                // Dessiner l'écran en arrière-plan
+                ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+                
+                // Dessiner la caméra par-dessus
+                ctx.save();
+                ctx.beginPath();
+                ctx.roundRect(x, y, cameraWidth, cameraHeight, 10);
+                ctx.clip();
+                ctx.drawImage(cameraVideo, x, y, cameraWidth, cameraHeight);
+                ctx.restore();
+                
+                sizeControls.style.display = 'block';
+            } else if (layout === 'side') {
+                // Côte à côte
+                const screenWidth = canvas.width * 0.7;
+                const cameraWidth = canvas.width * 0.3;
+                
+                ctx.drawImage(screenVideo, 0, 0, screenWidth, canvas.height);
+                ctx.drawImage(cameraVideo, screenWidth, 0, cameraWidth, canvas.height);
+                
+                sizeControls.style.display = 'none';
+            }
+            
+            if (currentStream) {
+                requestAnimationFrame(drawFrame);
+            }
+        }
+        
+        // Créer un stream à partir du canvas
+        currentStream = canvas.captureStream(30);
+        
+        // Ajouter l'audio du stream principal (écran ou caméra)
+        if (screenStream.getAudioTracks().length > 0) {
+            currentStream.addTrack(screenStream.getAudioTracks()[0]);
+        } else if (cameraStream.getAudioTracks().length > 0) {
+            currentStream.addTrack(cameraStream.getAudioTracks()[0]);
+        }
+        
+        preview.srcObject = currentStream;
+        drawFrame();
+    });
+}
+
+function updateCameraSize(value) {
+    document.getElementById('camera-size-value').textContent = value + '%';
+    if (currentStream && document.querySelector('.layout-btn.active')?.textContent === 'Incrustation') {
+        setLayout('pip');
+    }
+}
+
+function updateCameraPosition(position) {
+    if (currentStream && document.querySelector('.layout-btn.active')?.textContent === 'Incrustation') {
+        setLayout('pip');
+    }
+}
+
+function checkStreamReady() {
+    const startBtn = document.getElementById('start-stream-btn');
+    startBtn.disabled = !(screenStream || cameraStream);
+}
+
+async function startLiveStream() {
+    const title = document.getElementById('stream-title').value || 'Live Stream';
+    const description = document.getElementById('stream-description').value || '';
+    
+    if (!currentStream && !screenStream && !cameraStream) {
+        alert('Veuillez sélectionner au moins une source (caméra ou écran)');
+        return;
+    }
+    
+    try {
+        // Si pas de stream mixte, utiliser le stream principal
+        if (!currentStream) {
+            currentStream = screenStream || cameraStream;
+        }
+        
+        // Mettre à jour l'interface
+        isLive = true;
+        document.getElementById('start-stream-btn').style.display = 'none';
+        document.getElementById('stop-stream-btn').style.display = 'inline-block';
+        document.getElementById('stream-status').innerHTML = '<span class="status-indicator live">● En direct</span>';
+        
+        // Créer une entrée de contenu live dans la base de données
+        await createLiveContent(title, description);
+        
+        alert('✅ Live démarré ! Votre stream est maintenant en direct.');
+        
+    } catch (error) {
+        console.error('Erreur démarrage live:', error);
+        alert('Erreur lors du démarrage du live: ' + error.message);
+    }
+}
+
+async function stopLiveStream() {
+    try {
+        // Arrêter tous les streams
+        if (currentStream) {
+            currentStream.getTracks().forEach(track => track.stop());
+            currentStream = null;
+        }
+        
+        isLive = false;
+        document.getElementById('start-stream-btn').style.display = 'inline-block';
+        document.getElementById('stop-stream-btn').style.display = 'none';
+        document.getElementById('stream-status').innerHTML = '<span class="status-indicator offline">● Hors ligne</span>';
+        
+        alert('⏹️ Live arrêté.');
+        
+    } catch (error) {
+        console.error('Erreur arrêt live:', error);
+        alert('Erreur lors de l\'arrêt du live: ' + error.message);
+    }
+}
+
+async function getNextDayNumber(userId) {
+    const contents = getUserContentLocal(userId);
+    const maxDay = contents.length > 0 ? contents[0].day_number : 0;
+    return maxDay + 1;
+}
+
+async function createLiveContent(title, description) {
+    // Créer une entrée de contenu live
+    const contentData = {
+        userId: currentUser.id,
+        type: 'live',
+        state: 'success',
+        title: title,
+        description: description,
+        mediaUrl: null, // Pour un live, pas d'URL statique
+        dayNumber: await getNextDayNumber(currentUser.id)
+    };
+    
+    try {
+        const result = await createContent(contentData);
+        console.log('Contenu live créé:', result);
+    } catch (error) {
+        console.error('Erreur création contenu live:', error);
+    }
+}
+
+/* ========================================
+   CRÉATION DE CONTENU
+   ======================================== */
+
+function closeCreateMenu() {
+    const modal = document.getElementById('create-modal');
+    modal.classList.remove('active');
+    setTimeout(() => {
+        modal.style.display = 'none';
+    }, 300);
+}
+
+async function openCreateMenu(userId, preSelectedArcId = null, existingContent = null) {
+    if (!currentUser || currentUser.id !== userId) return;
+    const profile = getCurrentUserProfile();
+    if (isUserBanned(profile)) {
+        const remaining = getBanRemainingLabel(profile);
+        const reason = profile?.banned_reason ? `Raison: ${profile.banned_reason}` : '';
+        alert(`Votre compte est temporairement banni. ${remaining ? `Fin dans ${remaining}.` : ''} ${reason}`.trim());
+        return;
+    }
+
+    // Get user ARCs for selection
+    let arcs = [];
+    try {
+        const { data } = await supabase
+            .from('arcs')
+            .select('id, title')
+            .eq('user_id', userId)
+            .eq('status', 'in_progress');
+        arcs = data || [];
+    } catch (e) {
+        console.error("Error fetching arcs for create menu", e);
+    }
+
+    // BLOCKAGE: Si l'utilisateur n'a pas d'ARC en cours, le forcer à en créer un
+    if (arcs.length === 0 && !existingContent) {
+        if (confirm("Vous devez créer un ARC avant de pouvoir poster une trace. Voulez-vous créer votre premier ARC maintenant ?")) {
+            closeCreateMenu();
+            if (window.openCreateModal) {
+                window.openCreateModal();
+            } else {
+                alert("Erreur: Impossible d'ouvrir la fenêtre de création d'ARC.");
+            }
+        }
+        return;
+    }
+
+    const modal = document.getElementById('create-modal');
+    const container = modal.querySelector('.create-container');
+    
+    // Calculate next day ou utiliser jour existant si édition
+    const contents = getUserContentLocal(userId);
+    // Safe maxDay calculation
+    let maxDay = 0;
+    if (contents && contents.length > 0) {
+        // Ensure day_number is a valid number
+        const validContent = contents.find(c => !isNaN(parseInt(c.dayNumber)));
+        if (validContent) {
+            maxDay = parseInt(validContent.dayNumber);
+        }
+    }
+    const nextDay = existingContent ? existingContent.day_number : maxDay + 1;
+
+    // Get user projects for selection
+    const projects = userProjects[userId] || [];
+    
+    // Generate ARC Options (Mandatory)
+    let arcOptions = '';
+    // Si on édite une trace existante qui n'a pas d'arc (legacy), on laisse l'option vide ou on force ?
+    // Le user veut "chaque trace publiée doit faire partie d'un arc".
+    // On va forcer la sélection.
+    
+    arcOptions = arcs.map(a => {
+        const selected = (preSelectedArcId && a.id === preSelectedArcId) || (existingContent && (existingContent.arcId === a.id || existingContent.arc_id === a.id)) ? 'selected' : '';
+        return `<option value="${a.id}" ${selected}>${a.title}</option>`;
+    }).join('');
+
+    const isEdit = !!existingContent;
+    const title = isEdit ? 'Modifier la Trace' : 'Nouvelle Trace';
+    const subtitle = isEdit ? `Modifier la trace du jour ${nextDay}` : `Documentez votre progression du jour ${nextDay}`;
+
+    container.innerHTML = `
+        <div class="settings-section">
+            <div class="settings-header" style="border:none; margin-bottom:1rem; padding-bottom:0;">
+                <h2>${title}</h2>
+                <p>${subtitle}</p>
+            </div>
+            
+            <form id="create-form">
+                ${isEdit ? `<input type="hidden" id="content-id" value="${existingContent.contentId || existingContent.id}">` : ''}
+                
+                <div class="form-group">
+                    <label>Jour #</label>
+                    <input type="number" id="create-day" class="form-input" value="${nextDay}" required>
+                </div>
+
+                <div class="form-group">
+                    <label>Titre de l'accomplissement</label>
+                    <input type="text" id="create-title" class="form-input" placeholder="Ex: Intégration de l'API terminée" value="${isEdit ? existingContent.title : ''}" required>
+                </div>
+
+                <div class="form-group">
+                    <label>Description</label>
+                    <textarea id="create-desc" class="form-input" rows="4" placeholder="Détaillez ce que vous avez fait, appris ou surmonté..." required>${isEdit ? existingContent.description : ''}</textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>État</label>
+                    <select id="create-state" class="form-input">
+                        <option value="success" ${isEdit && existingContent.state === 'success' ? 'selected' : ''}>Victoire (Vert)</option>
+                        <option value="failure" ${isEdit && existingContent.state === 'failure' ? 'selected' : ''}>Bloqué / Échec (Rouge)</option>
+                        <option value="pause" ${isEdit && existingContent.state === 'pause' ? 'selected' : ''}>Pause / Réflexion (Violet)</option>
+                    </select>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Projet (Optionnel)</label>
+                        <select id="create-project" class="form-input">
+                            <option value="">Aucun projet spécifique</option>
+                            ${projects.map(p => `<option value="${p.id}" ${isEdit && (existingContent.projectId === p.id || existingContent.project_id === p.id) ? 'selected' : ''}>${p.name}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>ARC (Requis)</label>
+                        <select id="create-arc" class="form-input" required>
+                            <option value="" disabled ${!isEdit && !preSelectedArcId ? 'selected' : ''}>Choisir un ARC...</option>
+                            ${arcOptions}
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Type de média</label>
+                    <select id="create-type" class="form-input">
+                        <option value="image" ${isEdit && existingContent.type === 'image' ? 'selected' : ''}>Image</option>
+                        <option value="video" ${isEdit && existingContent.type === 'video' ? 'selected' : ''}>Vidéo</option>
+                        <option value="live" ${isEdit && existingContent.type === 'live' ? 'selected' : ''}>Live / Stream</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Média</label>
+                    
+                    <!-- Upload Zone for Image/Video -->
+                    <div id="media-upload-container">
+                        <div class="upload-zone" id="create-media-dropzone" style="border: 2px dashed var(--border-color); padding: 2rem; border-radius: 12px; text-align: center; cursor: pointer; transition: all 0.3s ease; background: rgba(255,255,255,0.02);">
+                            <div id="create-media-preview-container" style="display: none; margin-bottom: 1rem;">
+                                <!-- Preview will be inserted here -->
+                            </div>
+                            <div id="create-media-loader" style="display: none; margin-bottom: 1rem;">
+                                <div style="display: inline-block; width: 24px; height: 24px; border: 2px solid var(--accent-color); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+                                <p style="margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-secondary);">Upload en cours...</p>
+                            </div>
+                            <div id="create-media-placeholder">
+                                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color: var(--text-secondary); margin-bottom: 0.5rem;">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                    <polyline points="17 8 12 3 7 8"></polyline>
+                                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                                </svg>
+                                <p style="color: var(--text-secondary); font-size: 0.9rem;">Cliquez ou glissez un fichier ici</p>
+                                <p style="color: var(--text-secondary); font-size: 0.75rem; opacity: 0.7;">JPG, PNG, GIF, MP4 (Max 50MB)</p>
+                            </div>
+                        </div>
+                        <input type="file" id="create-media-file" accept="image/*,video/*" style="display: none;">
+                    </div>
+
+                    <!-- URL Input for Live -->
+                    <div id="media-url-container" style="display: none;">
+                        <input type="text" id="create-live-url" class="form-input" placeholder="Lien du Live (ex: Twitch, YouTube...)" style="margin-bottom: 0.5rem;">
+                        <p class="form-hint">Le lien sera affiché comme une trace active.</p>
+                    </div>
+
+                    <input type="hidden" id="create-media-url" value="${isEdit && (existingContent.media_url || existingContent.mediaUrl) ? (existingContent.media_url || existingContent.mediaUrl) : ''}">
+                    <input type="hidden" id="create-media-type" value="${isEdit && existingContent.type ? existingContent.type : 'image'}">
+                </div>
+
+                <div class="actions-bar">
+                    <button type="button" class="btn-cancel" onclick="closeCreateMenu()">Annuler</button>
+                    <button type="submit" class="btn-save">${isEdit ? 'Mettre à jour' : 'Publier la trace'}</button>
+                </div>
+            </form>
+        </div>
+    `;
+
+    modal.style.display = 'block';
+    // Force reflow
+    modal.offsetHeight;
+    modal.classList.add('active');
+
+    // Select elements globally for this function scope
+    const previewContainer = document.getElementById('create-media-preview-container');
+    const placeholder = document.getElementById('create-media-placeholder');
+    const uploadContainer = document.getElementById('media-upload-container');
+    const urlContainer = document.getElementById('media-url-container');
+    const liveInput = document.getElementById('create-live-url');
+
+    // Initialize file upload
+    if (typeof initializeFileInput === 'function') {
+        const typeSelect = document.getElementById('create-type');
+        const mediaUrlInput = document.getElementById('create-media-url');
+        const mediaTypeInput = document.getElementById('create-media-type');
+        
+        const dropZone = document.getElementById('create-media-dropzone');
+        const fileInput = document.getElementById('create-media-file');
+        const loader = document.getElementById('create-media-loader');
+
+        // Toggle logic
+        typeSelect.addEventListener('change', () => {
+            const type = typeSelect.value;
+            mediaTypeInput.value = type;
+            
+            if (type === 'live') {
+                uploadContainer.style.display = 'none';
+                urlContainer.style.display = 'block';
+                // Use the live URL if set
+                mediaUrlInput.value = liveInput.value;
+            } else {
+                uploadContainer.style.display = 'block';
+                urlContainer.style.display = 'none';
+                
+                // Update accept attribute
+                if (type === 'image') {
+                    fileInput.accept = 'image/*';
+                } else if (type === 'video') {
+                    fileInput.accept = 'video/*';
+                }
+            }
+        });
+
+        // Live URL handler
+        liveInput.addEventListener('input', () => {
+            if (typeSelect.value === 'live') {
+                mediaUrlInput.value = liveInput.value;
+            }
+        });
+        
+        // Handle click on dropzone (prevent double click if clicking preview)
+        dropZone.addEventListener('click', (e) => {
+            if (e.target.tagName !== 'IMG' && e.target.tagName !== 'VIDEO') {
+                fileInput.click();
+            }
+        });
+
+        // Add spinning animation style if not exists
+        if (!document.getElementById('spin-style')) {
+            const style = document.createElement('style');
+            style.id = 'spin-style';
+            style.innerHTML = '@keyframes spin { to { transform: rotate(360deg); } }';
+            document.head.appendChild(style);
+        }
+
+        // Custom handler to show loader
+        fileInput.addEventListener('change', () => {
+             if (fileInput.files.length > 0) {
+                 placeholder.style.display = 'none';
+                 previewContainer.style.display = 'none';
+                 loader.style.display = 'block';
+             }
+        });
+
+        initializeFileInput('create-media-file', {
+            dropZone: dropZone,
+            compress: true,
+            onUpload: (result) => {
+                loader.style.display = 'none';
+                
+                if (result.success) {
+                    document.getElementById('create-media-url').value = result.url;
+                    document.getElementById('create-media-type').value = result.type;
+                    
+                    // Update Preview
+                    previewContainer.style.display = 'block';
+                    
+                    if (result.type === 'image') {
+                        previewContainer.innerHTML = `<img src="${result.url}" style="max-width: 100%; max-height: 300px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);">`;
+                    } else {
+                        previewContainer.innerHTML = `<video src="${result.url}" controls style="max-width: 100%; max-height: 300px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);"></video>`;
+                    }
+                } else {
+                    placeholder.style.display = 'block';
+                    alert('Erreur upload: ' + result.error);
+                }
+            }
+        });
+    }
+
+    // Préremplir les champs existants si édition
+    if (isEdit && existingContent) {
+        const mediaUrl = existingContent.media_url || existingContent.mediaUrl;
+        if (mediaUrl) {
+            previewContainer.style.display = 'block';
+            placeholder.style.display = 'none';
+            
+            if (existingContent.type === 'image') {
+                previewContainer.innerHTML = `<img src="${mediaUrl}" style="max-width: 100%; max-height: 300px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);">`;
+            } else if (existingContent.type === 'video') {
+                previewContainer.innerHTML = `<video src="${mediaUrl}" controls style="max-width: 100%; max-height: 300px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);"></video>`;
+            } else if (existingContent.type === 'live') {
+                uploadContainer.style.display = 'none';
+                urlContainer.style.display = 'block';
+                liveInput.value = mediaUrl;
+            }
+        }
+    }
+
+    // Handle form submission
+    document.getElementById('create-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        const mediaUrl = document.getElementById('create-media-url').value;
+        if (!mediaUrl) {
+            alert("Veuillez uploader une image ou une vidéo.");
+            return;
+        }
+
+        const btnSave = e.target.querySelector('.btn-save');
+        const originalText = btnSave.textContent;
+        btnSave.disabled = true;
+        btnSave.textContent = isEdit ? 'Mise à jour...' : 'Publication...';
+
+        const contentData = {
+            userId: userId,
+            dayNumber: parseInt(document.getElementById('create-day').value),
+            title: document.getElementById('create-title').value,
+            description: document.getElementById('create-desc').value,
+            state: document.getElementById('create-state').value,
+            type: document.getElementById('create-media-type').value,
+            mediaUrl: mediaUrl,
+            projectId: document.getElementById('create-project').value || null,
+            arcId: document.getElementById('create-arc').value || null
+        };
+
+        let result;
+        if (isEdit) {
+            // Mise à jour
+            const contentId = document.getElementById('content-id').value;
+            result = await updateContent(contentId, contentData);
+        } else {
+            // Création
+            result = await createContent(contentData);
+        }
+        
+        if (result.success) {
+            // Recharger les données locales et rafraîchir l'interface
+            const contentResult = await getUserContent(userId);
+            if (contentResult.success) {
+                userContents[userId] = contentResult.data.map(convertSupabaseContent);
+            }
+            
+            // Reload profile view
+            if (document.querySelector('#profile.active')) {
+                await renderProfileIntoContainer(userId);
+            }
+
+            // Update User Card in Discover Grid if present
+            const userCard = document.querySelector(`.user-card[data-user="${userId}"]`);
+            if (userCard) {
+                userCard.outerHTML = renderUserCard(userId);
+            }
+
+            // Refresh Arc details if open
+            if (document.getElementById('immersive-overlay') && document.getElementById('immersive-overlay').style.display === 'block' && window.currentArc) {
+                if (window.openArcDetails) {
+                    window.openArcDetails(window.currentArc.id);
+                }
+            }
+            
+            closeCreateMenu();
+        } else {
+            alert('Erreur: ' + result.error);
+        }
+        
+        btnSave.disabled = false;
+        btnSave.textContent = originalText;
+    });
+}
+
+/* ========================================
+   GESTION DU CONTENU - MODIFICATION/SUPPRESSION
+   ======================================== */
+
+async function editContent(contentId) {
+    try {
+        // Récupérer les détails du contenu SANS JOINTS pour éviter les erreurs de relations
+        // Les noms des arcs et projets sont de toute façon chargés dans le menu via userContents/userProjects
+        const { data: content, error } = await supabase
+            .from('content')
+            .select('*')
+            .eq('id', contentId)
+            .single();
+
+        if (error) throw error;
+
+        // Vérifier que c'est bien le contenu de l'utilisateur connecté
+        if (!currentUser || content.user_id !== currentUser.id) {
+            alert('Vous ne pouvez modifier que votre propre contenu.');
+            return;
+        }
+
+        // Pré-remplir le formulaire d'édition
+        // content contient arc_id et project_id en snake_case, que openCreateMenu gère maintenant
+        await openCreateMenu(currentUser.id, content.arc_id, content);
+
+    } catch (error) {
+        console.error('Erreur lors de la récupération du contenu:', error);
+        alert('Erreur lors du chargement du contenu: ' + (error.message || error));
+    }
+}
+
+async function deleteContent(contentId) {
+    if (!confirm('Êtes-vous sûr de vouloir supprimer cette trace ? Cette action est irréversible.')) {
+        return;
+    }
+
+    console.log('Tentative de suppression du contenu ID:', contentId);
+    console.log('Utilisateur actuel:', currentUser);
+
+    if (!window.currentUser) {
+        alert('Vous devez être connecté pour supprimer une trace.');
+        return;
+    }
+
+    try {
+        // Vérifier d'abord que le contenu existe et appartient à l'utilisateur
+        const { data: contentToDelete, error: fetchError } = await supabase
+            .from('content')
+            .select('id, user_id, title')
+            .eq('id', contentId)
+            .single();
+
+        if (fetchError) {
+            console.error('Erreur lors de la récupération du contenu:', fetchError);
+            throw new Error('Contenu introuvable: ' + fetchError.message);
+        }
+
+        if (contentToDelete.user_id !== currentUser.id) {
+            alert('Vous ne pouvez supprimer que votre propre contenu.');
+            return;
+        }
+
+        console.log('Contenu à supprimer:', contentToDelete);
+
+        // Procéder à la suppression
+        const { error } = await supabase
+            .from('content')
+            .delete()
+            .eq('id', contentId);
+
+        if (error) {
+            console.error('Erreur Supabase lors de la suppression:', error);
+            throw error;
+        }
+
+        console.log('Suppression réussie, rechargement du profil...');
+
+        // Recharger le contenu de l'utilisateur
+        const contentResult = await getUserContent(currentUser.id);
+        if (contentResult.success) {
+            userContents[currentUser.id] = contentResult.data.map(convertSupabaseContent);
+        }
+
+        // Recharger le profil
+        if (document.querySelector('#profile.active')) {
+            await renderProfileIntoContainer(currentUser.id);
+        }
+        
+        // Update User Card in Discover Grid if present
+        const userCard = document.querySelector(`.user-card[data-user="${currentUser.id}"]`);
+        if (userCard) {
+            userCard.outerHTML = renderUserCard(currentUser.id);
+        }
+
+        // Refresh Arc details if open
+        if (document.getElementById('immersive-overlay') && document.getElementById('immersive-overlay').style.display === 'block' && window.currentArc) {
+            if (window.openArcDetails) {
+                window.openArcDetails(window.currentArc.id);
+            }
+        }
+
+        alert('Trace supprimée avec succès.');
+
+    } catch (error) {
+        console.error('Erreur lors de la suppression:', error);
+        alert('Erreur lors de la suppression de la trace: ' + error.message);
+    }
+}
+
+// Rendre les fonctions disponibles globalement
+window.editContent = editContent;
+window.deleteContent = deleteContent;
+window.openSettings = openSettings;
+window.closeSettings = closeSettings;
+window.openCreateMenu = openCreateMenu;
+window.closeCreateMenu = closeCreateMenu;
+window.toggleTimelineExpand = toggleTimelineExpand;
+window.openImmersive = openImmersive;
+window.closeImmersive = closeImmersive;
+window.navigateToUserProfile = navigateToUserProfile;
+window.renderUsernameWithBadge = renderUsernameWithBadge;
+window.renderAmbassadorBadgeById = renderAmbassadorBadgeById;
+window.isAmbassadorUserId = isAmbassadorUserId;
+window.requestVerification = requestVerification;
+window.addVerifiedUserId = addVerifiedUserId;
+window.handleVerificationSelection = handleVerificationSelection;
+window.isSuperAdmin = isSuperAdmin;
+window.createAdminAnnouncement = createAdminAnnouncement;
+window.banUserByAdmin = banUserByAdmin;
+window.unbanUserByAdmin = unbanUserByAdmin;
+window.softDeleteContentByAdmin = softDeleteContentByAdmin;
+window.restoreContentByAdmin = restoreContentByAdmin;
+window.hardDeleteContentByAdmin = hardDeleteContentByAdmin;
+window.hardDeleteUserByAdmin = hardDeleteUserByAdmin;
+window.toggleFollow = toggleFollow;
+if (typeof openArcDetails !== 'undefined') {
+    window.openArcDetails = openArcDetails;
+}
+window.toggleTheme = toggleTheme;
+window.handleSignOut = handleSignOut;
+
+/* ========================================
+   INITIALISATION AU CHARGEMENT
+   ======================================== */
+
+document.addEventListener('DOMContentLoaded', function() {
+    initializeApp();
+});
+window.openCreateMenu = openCreateMenu;
+
+/* ========================================
+   REALTIME SUBSCRIPTIONS
+   ======================================== */
+
+function subscribeToRealtime() {
+    console.log('Initialisation des souscriptions Realtime...');
+
+    const scheduleDiscoverRefresh = (() => {
+        let timer = null;
+        return () => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(() => {
+                if (typeof renderDiscoverGrid === 'function') {
+                    renderDiscoverGrid();
+                }
+            }, 300);
+        };
+    })();
+    
+    // Souscription aux changements de la table 'content'
+    supabase
+        .channel('public:content')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'content' }, async (payload) => {
+            console.log('Changement détecté dans content:', payload);
+            
+            const { eventType, new: newRecord } = payload;
+            
+            if (eventType === 'INSERT' || eventType === 'UPDATE') {
+                const userId = newRecord.user_id;
+                
+                // Recharger le contenu de l'utilisateur concerné
+                const contentResult = await getUserContent(userId);
+                if (contentResult.success) {
+                    userContents[userId] = contentResult.data.map(convertSupabaseContent);
+                    
+                    // Si on affiche le profil de cet utilisateur, rafraîchir
+                    if (window.currentProfileViewed === userId) {
+                        console.log('Mise à jour automatique du profil...');
+                        await renderProfileIntoContainer(userId);
+                    }
+                    
+                    // Update User Card in Discover Grid if present
+                    const userCard = document.querySelector(`.user-card[data-user="${userId}"]`);
+                    if (userCard) {
+                        const isFollowed = window.currentUser ? await isFollowing(window.currentUser.id, userId) : false;
+                        userCard.outerHTML = renderUserCard(userId, isFollowed);
+                    }
+                }
+            }
+        })
+        .subscribe();
+
+    // Souscription aux changements de la table 'streaming_sessions'
+    supabase
+        .channel('public:streaming_sessions')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'streaming_sessions' }, (payload) => {
+            console.log('Changement détecté dans streaming_sessions:', payload);
+            scheduleDiscoverRefresh();
+        })
+        .subscribe();
+}
+
+/* ========================================
+   GESTION DE LA LECTURE VIDÉO SYNCHRONISÉE
+   ======================================== */
+
+// Stocker l'état des vidéos
+window.videoStates = new Map();
+
+// Gérer la visibilité de la page pour contrôler les vidéos
+document.addEventListener('visibilitychange', () => {
+    const videos = document.querySelectorAll('video.card-media, video.immersive-video');
+    
+    if (document.hidden) {
+        // Page cachée : mettre en pause toutes les vidéos et sauvegarder l'état
+        videos.forEach(video => {
+            if (!video.paused) {
+                const videoId = video.id || `video-${Date.now()}`;
+                window.videoStates.set(videoId, {
+                    currentTime: video.currentTime,
+                    wasPlaying: true
+                });
+                video.pause();
+            }
+        });
+    } else {
+        // Page visible : reprendre les vidéos qui étaient en lecture
+        videos.forEach(video => {
+            const videoId = video.id || `video-${Date.now()}`;
+            const savedState = window.videoStates.get(videoId);
+            
+            if (savedState && savedState.wasPlaying) {
+                video.currentTime = savedState.currentTime;
+                video.play().catch(e => console.log('Reprise vidéo bloquée:', e));
+                window.videoStates.delete(videoId);
+            }
+        });
+    }
+});
+
+// Gérer le focus/défocus de la fenêtre
+window.addEventListener('blur', () => {
+    const videos = document.querySelectorAll('video.card-media, video.immersive-video');
+    videos.forEach(video => {
+        if (!video.paused) {
+            const videoId = video.id || `video-${Date.now()}`;
+            window.videoStates.set(videoId, {
+                currentTime: video.currentTime,
+                wasPlaying: true
+            });
+            video.pause();
+        }
+    });
+});
+
+window.addEventListener('focus', () => {
+    const videos = document.querySelectorAll('video.card-media, video.immersive-video');
+    videos.forEach(video => {
+        const videoId = video.id || `video-${Date.now()}`;
+        const savedState = window.videoStates.get(videoId);
+        
+        if (savedState && savedState.wasPlaying) {
+            video.currentTime = savedState.currentTime;
+            video.play().catch(e => console.log('Reprise vidéo bloquée:', e));
+            window.videoStates.delete(videoId);
+        }
+    });
+});
+
+// Initialiser les gestionnaires d'événements pour les nouvelles vidéos
+function initializeVideoControls() {
+    const videos = document.querySelectorAll('video.card-media, video.immersive-video');
+    
+    videos.forEach(video => {
+        // S'assurer que la vidéo a un ID unique
+        if (!video.id) {
+            video.id = `video-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        }
+        
+        // Garder les vidéos des cartes muettes, permettre le son pour les vidéos immersives
+        if (video.classList.contains('card-media')) {
+            video.muted = true; // Forcer muted pour les cartes
+        } else if (video.classList.contains('immersive-video')) {
+            video.muted = false; // Permettre le son pour le feed immersif
+        }
+        
+        // Ajouter des gestionnaires pour les interactions utilisateur
+        video.addEventListener('mouseenter', () => {
+            if (video.paused && video.readyState >= 2) {
+                video.play().catch(e => console.log('Lecture vidéo bloquée:', e));
+            }
+        });
+        
+        video.addEventListener('mouseleave', () => {
+            // Optionnel : mettre en pause quand la souris quitte
+            // video.pause();
+        });
+    });
+}
+
+// Appeler l'initialisation après le chargement du DOM
+document.addEventListener('DOMContentLoaded', initializeVideoControls);
+
+// Observer les changements dans le DOM pour les nouvelles vidéos
+const observer = new MutationObserver((mutations) => {
+    mutations.forEach((mutation) => {
+        if (mutation.type === 'childList') {
+            mutation.addedNodes.forEach((node) => {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    const videos = node.querySelectorAll ? node.querySelectorAll('video') : [];
+                    if (videos.length > 0) {
+                        initializeVideoControls();
+                    }
+                }
+            });
+        }
+    });
+});
+
+observer.observe(document.body, {
+    childList: true,
+    subtree: true
+});
