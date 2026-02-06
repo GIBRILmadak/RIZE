@@ -17,6 +17,8 @@ if (!window.__streamingLoaded) {
     let lastPreviewStamp = 0;
     let peerConnections = new Map();
     let localMediaStream = null;
+    let hostMicStream = null;
+    let hostAudioContext = null;
     let activeStreamId = null;
     let isStreamHost = false;
     let pendingViewerJoins = new Set();
@@ -430,6 +432,24 @@ function cleanupStream() {
     previewCtx = null;
     previewInFlight = false;
     lastPreviewStamp = 0;
+
+    if (localMediaStream) {
+        localMediaStream.getTracks().forEach(track => {
+            try { track.stop(); } catch (e) {}
+        });
+    }
+
+    if (hostMicStream) {
+        hostMicStream.getTracks().forEach(track => {
+            try { track.stop(); } catch (e) {}
+        });
+        hostMicStream = null;
+    }
+
+    if (hostAudioContext) {
+        try { hostAudioContext.close(); } catch (e) {}
+        hostAudioContext = null;
+    }
     
     peerConnections.forEach(pc => {
         try { pc.close(); } catch (e) {}
@@ -495,6 +515,7 @@ function createPeerConnection(peerId, isHostSide) {
                 video.autoplay = true;
                 video.playsInline = true;
                 video.muted = true;
+                syncAudioButtonState(true);
                 const playPromise = video.play();
                 if (playPromise && typeof playPromise.catch === 'function') {
                     playPromise.catch(() => {});
@@ -738,6 +759,25 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+function syncAudioButtonState(isMuted) {
+    const audioBtn = document.getElementById('audio-toggle-btn');
+    if (!audioBtn) return;
+    audioBtn.classList.toggle('active', !isMuted);
+}
+
+function toggleAudio() {
+    const video = document.getElementById('stream-video');
+    if (!video) return;
+    video.muted = !video.muted;
+    syncAudioButtonState(video.muted);
+    if (!video.muted) {
+        const playPromise = video.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(() => {});
+        }
+    }
+}
+
 // Configurer les médias du diffuseur (Host)
 async function setupBroadcasterMedia(options = {}) {
     try {
@@ -785,9 +825,17 @@ async function setupBroadcasterMedia(options = {}) {
             }
         };
 
+        const requestMicStream = async () => {
+            try {
+                return await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            } catch (error) {
+                return null;
+            }
+        };
+
         if (source === 'screen' && navigator.mediaDevices.getDisplayMedia) {
             try {
-                stream = await requestDisplayMedia({
+                const screenStream = await requestDisplayMedia({
                     video: {
                         width: { ideal: 1920 },
                         height: { ideal: 1080 },
@@ -795,6 +843,56 @@ async function setupBroadcasterMedia(options = {}) {
                     },
                     audio: true
                 });
+
+                const micStream = await requestMicStream();
+                if (!micStream) {
+                    console.warn('Micro non disponible pour le partage d\'écran');
+                }
+
+                const screenAudioTracks = screenStream.getAudioTracks();
+                const micAudioTracks = micStream ? micStream.getAudioTracks() : [];
+                const hasScreenAudio = screenAudioTracks.length > 0;
+                const hasMicAudio = micAudioTracks.length > 0;
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+
+                if (hasScreenAudio || hasMicAudio) {
+                    const mergedStream = new MediaStream();
+                    screenStream.getVideoTracks().forEach(track => mergedStream.addTrack(track));
+
+                    if (hasScreenAudio && hasMicAudio && AudioCtx) {
+                        try {
+                            const audioContext = new AudioCtx();
+                            const destination = audioContext.createMediaStreamDestination();
+                            audioContext.createMediaStreamSource(screenStream).connect(destination);
+                            audioContext.createMediaStreamSource(micStream).connect(destination);
+                            const mixedTrack = destination.stream.getAudioTracks()[0];
+                            if (mixedTrack) {
+                                mergedStream.addTrack(mixedTrack);
+                                hostAudioContext = audioContext;
+                            } else {
+                                const fallbackTrack = micAudioTracks[0] || screenAudioTracks[0];
+                                if (fallbackTrack) mergedStream.addTrack(fallbackTrack);
+                                audioContext.close();
+                            }
+                        } catch (error) {
+                            console.warn('Mix audio impossible, fallback:', error);
+                            const fallbackTrack = micAudioTracks[0] || screenAudioTracks[0];
+                            if (fallbackTrack) mergedStream.addTrack(fallbackTrack);
+                        }
+                    } else {
+                        const fallbackTrack = micAudioTracks[0] || screenAudioTracks[0];
+                        if (fallbackTrack) mergedStream.addTrack(fallbackTrack);
+                    }
+
+                    stream = mergedStream;
+                } else {
+                    stream = screenStream;
+                    if (window.ToastManager) {
+                        ToastManager.info('Audio indisponible', 'Activez le micro ou cochez "Partager l\'audio" pendant le partage d\'écran.');
+                    }
+                }
+
+                hostMicStream = micStream;
             } catch (error) {
                 if (isMobile) {
                     if (window.ToastManager) {
@@ -829,6 +927,7 @@ async function setupBroadcasterMedia(options = {}) {
             video.muted = true; // Garder muet pour permettre l'autoplay
             video.autoplay = true;
             video.playsInline = true;
+            syncAudioButtonState(true);
             const playPromise = video.play();
             if (playPromise && typeof playPromise.catch === 'function') {
                 playPromise.catch(() => {});
@@ -893,8 +992,7 @@ async function setupBroadcasterMedia(options = {}) {
             // Activer le son par défaut pour le host
             const audioBtn = document.getElementById('audio-toggle-btn');
             if (audioBtn) {
-                audioBtn.classList.add('active');
-                audioBtn.style.color = '#10b981';
+                syncAudioButtonState(video.muted);
             }
             
             localMediaStream = stream;
@@ -1149,6 +1247,7 @@ function setViewerWaiting(isWaiting) {
     window.endStream = endStream;
     window.leaveStream = leaveStream;
     window.initializeStreamPage = initializeStreamPage;
+    window.toggleAudio = toggleAudio;
 } else {
     console.warn('streaming.js déjà chargé, initialisation ignorée.');
 }
