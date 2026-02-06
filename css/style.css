@@ -1142,6 +1142,23 @@ nav {
 
 .btn:active { transform: translateY(0); box-shadow: 0 3px 8px rgba(0,0,0,0.4); }
 
+.btn-share-profile {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border-color);
+    padding: 0.35rem 0.55rem;
+    border-radius: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    box-shadow: none;
+}
+
+.btn-share-profile img {
+    width: 18px;
+    height: 18px;
+}
+
 /* Modales génériques pour création et formulaires */
 .modal-overlay {
     position: fixed;

@@ -3,6 +3,7 @@
    ======================================== */
 
 window.analyticsCharts = window.analyticsCharts || {};
+window.analyticsShareState = window.analyticsShareState || {};
 
 function getAnalyticsDomIds(containerId) {
     const safeId = String(containerId || 'analytics-dashboard').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -11,7 +12,10 @@ function getAnalyticsDomIds(containerId) {
         safeId,
         selectId: `month-select-${safeId}`,
         canvasId: `analytics-month-chart-${safeId}`,
-        messageId: `analytics-message-${safeId}`
+        messageId: `analytics-message-${safeId}`,
+        shareBtnId: `analytics-share-btn-${safeId}`,
+        downloadBtnId: `analytics-download-btn-${safeId}`,
+        sharePanelId: `analytics-share-panel-${safeId}`
     };
 }
 
@@ -22,11 +26,205 @@ function cleanupAnalytics(containerId = 'analytics-dashboard') {
         chart.destroy();
         delete window.analyticsCharts[safeId];
     }
+    if (window.analyticsShareState && window.analyticsShareState[safeId]) {
+        delete window.analyticsShareState[safeId];
+    }
 
     const dashboard = document.getElementById(dashId);
     if (dashboard) {
         dashboard.innerHTML = '';
     }
+}
+
+function setAnalyticsMessage(containerId, text, timeoutMs = 2500) {
+    const { messageId } = getAnalyticsDomIds(containerId);
+    const message = document.getElementById(messageId);
+    if (!message) return;
+    message.textContent = text || '';
+    if (text && timeoutMs) {
+        setTimeout(() => {
+            if (message.textContent === text) {
+                message.textContent = '';
+            }
+        }, timeoutMs);
+    }
+}
+
+function notifyAnalytics(containerId, text, type = 'info') {
+    if (window.ToastManager) {
+        if (type === 'success') ToastManager.success('Info', text);
+        else if (type === 'error') ToastManager.error('Erreur', text);
+        else ToastManager.info('Info', text);
+        return;
+    }
+    setAnalyticsMessage(containerId, text);
+}
+
+function buildAnalyticsShareUrl(userId) {
+    try {
+        const base = new URL('analytics.html', window.location.href);
+        if (userId) base.searchParams.set('user', userId);
+        return base.toString();
+    } catch (error) {
+        return userId ? `analytics.html?user=${encodeURIComponent(userId)}` : 'analytics.html';
+    }
+}
+
+function formatAnalyticsShareLabel(state) {
+    if (!state) return 'Analytics RIZE';
+    const monthLabel = (state.year !== undefined && state.monthIndex !== undefined)
+        ? formatMonthLabel(state.year, state.monthIndex)
+        : '';
+    const namePart = state.userName ? ` · ${state.userName}` : '';
+    return monthLabel ? `Analytics ${monthLabel}${namePart}` : `Analytics RIZE${namePart}`;
+}
+
+function buildSocialShareUrls({ url, text }) {
+    const encodedUrl = encodeURIComponent(url || '');
+    const encodedText = encodeURIComponent(text || '');
+    return {
+        x: `https://twitter.com/intent/tweet?text=${encodedText}&url=${encodedUrl}`,
+        linkedin: `https://www.linkedin.com/sharing/share-offsite/?url=${encodedUrl}`,
+        facebook: `https://www.facebook.com/sharer/sharer.php?u=${encodedUrl}`
+    };
+}
+
+async function copyToClipboard(text) {
+    if (!text) return false;
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (error) {
+        console.error('Clipboard error:', error);
+    }
+    try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return ok;
+    } catch (error) {
+        console.error('Clipboard fallback error:', error);
+        return false;
+    }
+}
+
+function renderAnalyticsSharePanel(containerId, state) {
+    const { sharePanelId } = getAnalyticsDomIds(containerId);
+    const panel = document.getElementById(sharePanelId);
+    if (!panel) return;
+
+    const url = buildAnalyticsShareUrl(state?.userId);
+    const label = formatAnalyticsShareLabel(state);
+    const text = `Mes analytics${state?.userName ? ` · ${state.userName}` : ''} sur RIZE.`;
+    const shareUrls = buildSocialShareUrls({ url, text });
+
+    panel.innerHTML = `
+        <button class="btn btn-ghost analytics-share-action" data-action="copy">
+            <img src="icons/link.svg" alt="Lien">
+            Copier le lien
+        </button>
+        <a class="btn btn-ghost analytics-share-action" href="${shareUrls.x}" target="_blank" rel="noopener">
+            <img src="icons/twitter.svg" alt="X">
+            X
+        </a>
+        <a class="btn btn-ghost analytics-share-action" href="${shareUrls.linkedin}" target="_blank" rel="noopener">
+            <img src="icons/linkedin.svg" alt="LinkedIn">
+            LinkedIn
+        </a>
+        <a class="btn btn-ghost analytics-share-action" href="${shareUrls.facebook}" target="_blank" rel="noopener">
+            <img src="icons/facebook.svg" alt="Facebook">
+            Facebook
+        </a>
+        <div class="analytics-share-hint">Astuce : télécharge l'image pour la publier directement.</div>
+    `;
+
+    const copyBtn = panel.querySelector('[data-action="copy"]');
+    if (copyBtn) {
+        copyBtn.addEventListener('click', async () => {
+            const ok = await copyToClipboard(url);
+            notifyAnalytics(containerId, ok ? 'Lien copié !' : 'Impossible de copier le lien.', ok ? 'success' : 'error');
+        });
+    }
+
+    panel.style.display = 'flex';
+}
+
+async function downloadAnalyticsChart(containerId) {
+    const { safeId, canvasId } = getAnalyticsDomIds(containerId);
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) {
+        notifyAnalytics(containerId, "Graphique introuvable.", 'error');
+        return;
+    }
+    const state = window.analyticsShareState[safeId] || {};
+    const monthLabel = (state.year !== undefined && state.monthIndex !== undefined)
+        ? formatMonthLabel(state.year, state.monthIndex)
+        : 'mois';
+    const safeName = (state.userName || 'profil').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const fileName = `analytics-${safeName}-${monthLabel.replace(/\s+/g, '-')}.png`;
+
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png', 0.92));
+    if (!blob) {
+        notifyAnalytics(containerId, "Impossible de générer l'image.", 'error');
+        return;
+    }
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    notifyAnalytics(containerId, "Image téléchargée.", 'success');
+}
+
+async function shareAnalyticsChart(containerId) {
+    const { safeId, canvasId, sharePanelId } = getAnalyticsDomIds(containerId);
+    const canvas = document.getElementById(canvasId);
+    const state = window.analyticsShareState[safeId] || {};
+    const monthLabel = (state.year !== undefined && state.monthIndex !== undefined)
+        ? formatMonthLabel(state.year, state.monthIndex)
+        : '';
+    const title = monthLabel ? `Analytics · ${monthLabel}` : 'Analytics RIZE';
+    const text = monthLabel
+        ? `Mes analytics de ${monthLabel} sur RIZE.`
+        : `Mes analytics sur RIZE.`;
+    const url = buildAnalyticsShareUrl(state.userId);
+
+    if (navigator.share) {
+        try {
+            if (canvas && canvas.toBlob && navigator.canShare) {
+                const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png', 0.92));
+                if (blob) {
+                    const fileName = `analytics-${state.year || 'mois'}.png`;
+                    const file = new File([blob], fileName, { type: 'image/png' });
+                    if (navigator.canShare({ files: [file] })) {
+                        await navigator.share({ title, text, url, files: [file] });
+                        return;
+                    }
+                }
+            }
+            await navigator.share({ title, text, url });
+            return;
+        } catch (error) {
+            console.warn('Web Share cancelled or failed:', error);
+        }
+    }
+
+    const panel = document.getElementById(sharePanelId);
+    if (panel && panel.style.display === 'flex') {
+        panel.style.display = 'none';
+        return;
+    }
+    renderAnalyticsSharePanel(containerId, { ...state, userId: state.userId });
 }
 
 function getMonthInfo(dateObj) {
@@ -178,9 +376,10 @@ function buildSeries(metrics, daysInMonth, liveHours = []) {
 }
 
 function renderDashboardShell(months, selectedKey, containerId = 'analytics-dashboard') {
-    const { containerId: dashId, selectId, canvasId, messageId } = getAnalyticsDomIds(containerId);
+    const { containerId: dashId, selectId, canvasId, messageId, shareBtnId, downloadBtnId, sharePanelId } = getAnalyticsDomIds(containerId);
     const dashboard = document.getElementById(dashId);
     if (!dashboard) return;
+    const showShareActions = containerId === 'analytics-dashboard';
 
     const options = months.map((m) => {
         const selected = m.key === selectedKey ? 'selected' : '';
@@ -197,7 +396,20 @@ function renderDashboardShell(months, selectedKey, containerId = 'analytics-dash
             <select id="${selectId}" style="background: rgba(255,255,255,0.06); color: var(--text-primary); border: 1px solid var(--border-color); padding: 0.5rem 0.75rem; border-radius: 8px;">
                 ${options}
             </select>
+            ${showShareActions ? `
+                <div class="analytics-share-actions">
+                    <button class="btn btn-ghost analytics-share-btn" id="${downloadBtnId}">
+                        <img src="icons/camera.svg" alt="Télécharger">
+                        Télécharger
+                    </button>
+                    <button class="btn btn-ghost analytics-share-btn" id="${shareBtnId}">
+                        <img src="icons/link.svg" alt="Partager">
+                        Partager
+                    </button>
+                </div>
+            ` : ''}
         </div>
+        ${showShareActions ? `<div id="${sharePanelId}" class="analytics-share-panel" style="display:none;"></div>` : ''}
         <div class="chart-container" style="background: rgba(255,255,255,0.05); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border-color);">
             <canvas id="${canvasId}" height="320"></canvas>
         </div>
@@ -302,6 +514,14 @@ function renderMonthlyChart({ year, monthIndex, daysInMonth, series, containerId
             }
         }
     });
+
+    const existing = window.analyticsShareState[safeId] || {};
+    window.analyticsShareState[safeId] = {
+        ...existing,
+        year,
+        monthIndex,
+        daysInMonth
+    };
 }
 
 async function renderMonth(userId, year, monthIndex, containerId = 'analytics-dashboard') {
@@ -348,7 +568,12 @@ async function renderAnalyticsDashboard(user, options = {}) {
 
     renderDashboardShell(months, currentKey, containerId);
 
-    const { selectId } = getAnalyticsDomIds(containerId);
+    const { safeId, selectId, shareBtnId, downloadBtnId } = getAnalyticsDomIds(containerId);
+    window.analyticsShareState[safeId] = {
+        ...(window.analyticsShareState[safeId] || {}),
+        userId,
+        userName: user.name || user.username || 'Profil'
+    };
     const select = document.getElementById(selectId);
     if (!select) return;
 
@@ -363,6 +588,15 @@ async function renderAnalyticsDashboard(user, options = {}) {
         const { year, monthIndex } = getSelectedMonth();
         renderMonth(userId, year, monthIndex, containerId);
     });
+
+    const shareBtn = document.getElementById(shareBtnId);
+    if (shareBtn) {
+        shareBtn.addEventListener('click', () => shareAnalyticsChart(containerId));
+    }
+    const downloadBtn = document.getElementById(downloadBtnId);
+    if (downloadBtn) {
+        downloadBtn.addEventListener('click', () => downloadAnalyticsChart(containerId));
+    }
 
     const { year, monthIndex } = getSelectedMonth();
     await renderMonth(userId, year, monthIndex, containerId);

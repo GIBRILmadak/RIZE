@@ -47,6 +47,50 @@ function buildProfileUrl(userId) {
     return `${base}?user=${encodeURIComponent(userId)}`;
 }
 
+function buildProfileShareUrl(userId) {
+    const relative = buildProfileUrl(userId);
+    try {
+        return new URL(relative, window.location.href).toString();
+    } catch (error) {
+        return relative;
+    }
+}
+
+async function shareProfileLink(userId) {
+    if (!userId) return;
+    const user = getUser(userId);
+    const url = buildProfileShareUrl(userId);
+    const title = user ? `Profil de ${user.name} | RIZE` : 'Profil RIZE';
+    const text = user ? `Découvre le profil de ${user.name} sur RIZE.` : 'Découvre ce profil sur RIZE.';
+
+    if (navigator.share) {
+        try {
+            await navigator.share({ title, text, url });
+            return;
+        } catch (error) {
+            console.warn('Share cancelled or failed:', error);
+        }
+    }
+
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(url);
+            if (window.ToastManager) {
+                ToastManager.success('Lien copié', 'Le lien du profil est dans le presse-papiers.');
+            } else {
+                alert('Lien du profil copié.');
+            }
+            return;
+        }
+    } catch (error) {
+        console.error('Clipboard error:', error);
+    }
+
+    prompt('Copiez ce lien pour partager le profil :', url);
+}
+
+window.shareProfileLink = shareProfileLink;
+
 /* ========================================
    COLLABORATIONS D'ARC
    ======================================== */
@@ -3482,6 +3526,12 @@ async function renderProfileTimeline(userId) {
         </button>
     ` : '';
     
+    const shareButtonHtml = `
+        <button class="btn-share-profile" onclick="shareProfileLink('${userId}')" title="Partager le profil" aria-label="Partager le profil">
+            <img src="icons/link.svg" alt="Partager">
+        </button>
+    `;
+
     const followButtonHtml = !isOwnProfile && currentUserId ? `
         <button 
             class="btn btn-follow ${isFollowingThisUser ? 'unfollow' : ''}"
@@ -3811,7 +3861,10 @@ async function renderProfileTimeline(userId) {
                     </div>
                 </div>
                 ${engagementStatsHtml}
-                ${followButtonHtml}
+                <div class="profile-actions" style="margin-top:6px; display:flex; gap:8px; align-items:center; justify-content:center;">
+                    ${followButtonHtml}
+                    ${shareButtonHtml}
+                </div>
             ` : `
                 <div class="follow-section">
                     <div class="follower-stat">
@@ -3828,6 +3881,7 @@ async function renderProfileTimeline(userId) {
                     <button class="btn-add" onclick="openCreateMenu('${userId}')" title="Ajouter une trace">
                         <img src="icons/plus.svg" alt="Ajouter" style="width:18px;height:18px">
                     </button>
+                    ${shareButtonHtml}
                     <button class="btn-secondary profile-arc-btn" onclick="window.openCreateModal ? window.openCreateModal() : console.error('openCreateModal function not found')" title="Démarrer un ARC" style="padding: 0.5rem 1rem; border-radius: 12px; font-size: 0.85rem; display: flex; align-items: center; gap: 0.5rem;">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
                         Nouvel ARC
