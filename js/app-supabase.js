@@ -13,6 +13,8 @@ window.userProjects = {};
 window.adminAnnouncements = [];
 window.hasLoadedUsers = false;
 window.userLoadError = null;
+window.arcCollaboratorsCache = new Map();
+window.arcCollaboratorsPending = new Set();
 
 function isMobileDevice() {
     return window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
@@ -27,8 +29,16 @@ function getInitialProfileUserId() {
     }
 }
 
+function hasDiscoverPage() {
+    return !!document.getElementById('discover');
+}
+
+function hasProfilePage() {
+    return !!document.getElementById('profile');
+}
+
 function isProfileOnlyPage() {
-    return !!document.getElementById('profile') && !document.getElementById('discover');
+    return hasProfilePage() && !hasDiscoverPage();
 }
 
 function buildProfileUrl(userId) {
@@ -37,6 +47,304 @@ function buildProfileUrl(userId) {
     return `${base}?user=${encodeURIComponent(userId)}`;
 }
 
+/* ========================================
+   COLLABORATIONS D'ARC
+   ======================================== */
+
+function getArcCollaboratorsCached(arcId) {
+    if (!arcId) return [];
+    if (!window.arcCollaboratorsCache) window.arcCollaboratorsCache = new Map();
+    return window.arcCollaboratorsCache.get(arcId) || [];
+}
+
+function invalidateArcCollaboratorCache(arcId) {
+    if (!arcId || !window.arcCollaboratorsCache) return;
+    window.arcCollaboratorsCache.delete(arcId);
+}
+
+async function preloadArcCollaborators(arcIds) {
+    if (!Array.isArray(arcIds) || arcIds.length === 0 || !window.supabase) return;
+    if (!window.arcCollaboratorsCache) window.arcCollaboratorsCache = new Map();
+    if (!window.arcCollaboratorsPending) window.arcCollaboratorsPending = new Set();
+
+    const uniqueIds = Array.from(new Set(arcIds.filter(Boolean)));
+    const idsToFetch = uniqueIds.filter(id => !window.arcCollaboratorsCache.has(id) && !window.arcCollaboratorsPending.has(id));
+    if (idsToFetch.length === 0) return;
+
+    idsToFetch.forEach(id => window.arcCollaboratorsPending.add(id));
+
+    try {
+        const { data, error } = await supabase
+            .from('arc_collaborations')
+            .select('arc_id, collaborator_id, status')
+            .in('arc_id', idsToFetch)
+            .eq('status', 'accepted');
+
+        if (error) throw error;
+
+        const rows = data || [];
+        const collaboratorIds = Array.from(new Set(rows.map(r => r.collaborator_id).filter(Boolean)));
+
+        let usersById = new Map();
+        if (collaboratorIds.length > 0) {
+            const { data: usersData, error: usersError } = await supabase
+                .from('users')
+                .select('id, name, avatar')
+                .in('id', collaboratorIds);
+            if (usersError) throw usersError;
+            (usersData || []).forEach(u => usersById.set(u.id, u));
+        }
+
+        const map = new Map();
+        rows.forEach(row => {
+            const user = usersById.get(row.collaborator_id);
+            if (!user) return;
+            if (!map.has(row.arc_id)) map.set(row.arc_id, []);
+            map.get(row.arc_id).push(user);
+        });
+
+        idsToFetch.forEach(id => {
+            window.arcCollaboratorsCache.set(id, map.get(id) || []);
+        });
+    } catch (error) {
+        console.error('Erreur chargement collaborateurs ARC:', error);
+        idsToFetch.forEach(id => {
+            if (!window.arcCollaboratorsCache.has(id)) {
+                window.arcCollaboratorsCache.set(id, []);
+            }
+        });
+    } finally {
+        idsToFetch.forEach(id => window.arcCollaboratorsPending.delete(id));
+    }
+}
+
+async function fetchArcCollabStatusMap(arcIds, viewerId) {
+    const statusMap = new Map();
+    if (!viewerId || !Array.isArray(arcIds) || arcIds.length === 0 || !window.supabase) return statusMap;
+    const uniqueIds = Array.from(new Set(arcIds.filter(Boolean)));
+    if (uniqueIds.length === 0) return statusMap;
+
+    try {
+        const { data, error } = await supabase
+            .from('arc_collaborations')
+            .select('arc_id, status')
+            .eq('collaborator_id', viewerId)
+            .in('arc_id', uniqueIds);
+        if (error) throw error;
+        (data || []).forEach(row => {
+            if (row?.arc_id) statusMap.set(row.arc_id, row.status);
+        });
+    } catch (error) {
+        console.error('Erreur récupération statut collaboration ARC:', error);
+    }
+    return statusMap;
+}
+
+async function fetchPendingArcCollabRequests(ownerId) {
+    if (!ownerId || !window.supabase) return [];
+    try {
+        const { data, error } = await supabase
+            .from('arc_collaborations')
+            .select('id, arc_id, collaborator_id, created_at')
+            .eq('owner_id', ownerId)
+            .eq('status', 'pending')
+            .order('created_at', { ascending: false });
+        if (error) throw error;
+        const rows = data || [];
+        if (rows.length === 0) return [];
+
+        const arcIds = Array.from(new Set(rows.map(r => r.arc_id).filter(Boolean)));
+        const collaboratorIds = Array.from(new Set(rows.map(r => r.collaborator_id).filter(Boolean)));
+
+        const [arcRes, userRes] = await Promise.all([
+            arcIds.length > 0
+                ? supabase.from('arcs').select('id, title').in('id', arcIds)
+                : Promise.resolve({ data: [] }),
+            collaboratorIds.length > 0
+                ? supabase.from('users').select('id, name, avatar').in('id', collaboratorIds)
+                : Promise.resolve({ data: [] })
+        ]);
+
+        const arcMap = new Map((arcRes.data || []).map(a => [a.id, a]));
+        const userMap = new Map((userRes.data || []).map(u => [u.id, u]));
+
+        return rows.map(row => ({
+            id: row.id,
+            arcId: row.arc_id,
+            collaboratorId: row.collaborator_id,
+            createdAt: row.created_at,
+            arc: arcMap.get(row.arc_id) || null,
+            collaborator: userMap.get(row.collaborator_id) || null
+        }));
+    } catch (error) {
+        console.error('Erreur récupération demandes collaboration ARC:', error);
+        return [];
+    }
+}
+
+async function fetchCollaboratorArcs(userId) {
+    if (!userId || !window.supabase) return [];
+    try {
+        const { data, error } = await supabase
+            .from('arc_collaborations')
+            .select('arc_id')
+            .eq('collaborator_id', userId)
+            .eq('status', 'accepted');
+        if (error) throw error;
+        const arcIds = Array.from(new Set((data || []).map(r => r.arc_id).filter(Boolean)));
+        if (arcIds.length === 0) return [];
+
+        const { data: arcsData, error: arcsError } = await supabase
+            .from('arcs')
+            .select('*, users(id, name, avatar)')
+            .in('id', arcIds)
+            .order('created_at', { ascending: false });
+        if (arcsError) throw arcsError;
+
+        return arcsData || [];
+    } catch (error) {
+        console.error('Erreur récupération ARCs collaboratifs:', error);
+        return [];
+    }
+}
+
+async function requestArcCollaboration(arcId, ownerId) {
+    if (!window.currentUser) {
+        if (window.ToastManager) {
+            ToastManager.info('Connexion requise', 'Connectez-vous pour demander une collaboration');
+        } else {
+            alert('Connectez-vous pour demander une collaboration.');
+        }
+        setTimeout(() => window.location.href = 'login.html', 1200);
+        return;
+    }
+
+    if (!arcId || !ownerId) return;
+    if (window.currentUser.id === ownerId) {
+        ToastManager?.info('Déjà propriétaire', 'Vous êtes déjà propriétaire de cet ARC.');
+        return;
+    }
+
+    const profile = getCurrentUserProfile();
+    if (isUserBanned(profile)) {
+        const remaining = getBanRemainingLabel(profile);
+        ToastManager?.error('Compte temporairement banni', remaining ? `Vous pourrez réessayer dans ${remaining}.` : 'Vous ne pouvez pas collaborer pour le moment.');
+        return;
+    }
+
+    try {
+        const { error } = await supabase
+            .from('arc_collaborations')
+            .upsert({
+                arc_id: arcId,
+                owner_id: ownerId,
+                collaborator_id: window.currentUser.id,
+                status: 'pending'
+            }, { onConflict: 'arc_id,collaborator_id' });
+        if (error) throw error;
+
+        invalidateArcCollaboratorCache(arcId);
+        ToastManager?.success('Demande envoyée', 'Votre demande de collaboration a été envoyée.');
+        await renderProfileIntoContainer(window.currentProfileViewed || ownerId);
+    } catch (error) {
+        console.error('Erreur demande collaboration:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible d\'envoyer la demande.');
+    }
+}
+
+async function acceptArcCollaboration(requestId, arcId, collaboratorId) {
+    if (!requestId || !window.currentUser) return;
+    try {
+        const { error } = await supabase
+            .from('arc_collaborations')
+            .update({ status: 'accepted' })
+            .eq('id', requestId);
+        if (error) throw error;
+        invalidateArcCollaboratorCache(arcId);
+        ToastManager?.success('Collaboration acceptée', 'Le collaborateur a été ajouté.');
+        await renderProfileIntoContainer(window.currentUser.id);
+        if (typeof renderDiscoverGrid === 'function') renderDiscoverGrid();
+    } catch (error) {
+        console.error('Erreur acceptation collaboration:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible d\'accepter.');
+    }
+}
+
+async function declineArcCollaboration(requestId, arcId) {
+    if (!requestId || !window.currentUser) return;
+    try {
+        const { error } = await supabase
+            .from('arc_collaborations')
+            .update({ status: 'declined' })
+            .eq('id', requestId);
+        if (error) throw error;
+        invalidateArcCollaboratorCache(arcId);
+        ToastManager?.info('Demande refusée', 'La demande a été refusée.');
+        await renderProfileIntoContainer(window.currentUser.id);
+    } catch (error) {
+        console.error('Erreur refus collaboration:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de refuser.');
+    }
+}
+
+async function leaveArcCollaboration(arcId) {
+    if (!arcId || !window.currentUser) return;
+    try {
+        const { error } = await supabase
+            .from('arc_collaborations')
+            .update({ status: 'left' })
+            .eq('arc_id', arcId)
+            .eq('collaborator_id', window.currentUser.id);
+        if (error) throw error;
+        if (window.selectedArcId === arcId) {
+            window.selectedArcId = null;
+        }
+        invalidateArcCollaboratorCache(arcId);
+        ToastManager?.info('Collaboration quittée', 'Vous ne collaborez plus sur cet ARC.');
+        await renderProfileIntoContainer(window.currentProfileViewed || window.currentUser.id);
+        if (typeof renderDiscoverGrid === 'function') renderDiscoverGrid();
+    } catch (error) {
+        console.error('Erreur quitter collaboration:', error);
+        ToastManager?.error('Erreur', error?.message || 'Impossible de quitter la collaboration.');
+    }
+}
+
+function buildArcCollaboratorAvatars(content, options = {}) {
+    if (!content || !content.arc || !content.arc.id) return '';
+    const collaborators = getArcCollaboratorsCached(content.arc.id);
+    if (!collaborators || collaborators.length === 0) return '';
+
+    const ownerId = content.arc.ownerId || content.arc.user_id || null;
+    const ownerUser = ownerId ? (getUser(ownerId) || { id: ownerId, name: content.arc.ownerName, avatar: content.arc.ownerAvatar }) : null;
+    if (!ownerUser) return '';
+
+    let collaborator = null;
+    if (content.userId && content.userId !== ownerId) {
+        collaborator = collaborators.find(u => u.id === content.userId) || collaborators.find(u => u.id !== ownerId);
+    } else {
+        collaborator = collaborators.find(u => u.id !== ownerId);
+    }
+    if (!collaborator) return '';
+
+    const size = options.size || 22;
+    const className = options.className || '';
+    const label = options.label || 'Collaboration';
+
+    return `
+        <div class="arc-collab-avatars ${className}" title="${label}">
+            <img src="${ownerUser.avatar || 'https://placehold.co/32'}" alt="Avatar créateur" style="width:${size}px; height:${size}px;">
+            <img src="${collaborator.avatar || 'https://placehold.co/32'}" alt="Avatar collaborateur" style="width:${size}px; height:${size}px;">
+        </div>
+    `;
+}
+
+window.requestArcCollaboration = requestArcCollaboration;
+window.acceptArcCollaboration = acceptArcCollaboration;
+window.declineArcCollaboration = declineArcCollaboration;
+window.leaveArcCollaboration = leaveArcCollaboration;
+window.fetchArcCollabStatusMap = fetchArcCollabStatusMap;
+window.fetchCollaboratorArcs = fetchCollaboratorArcs;
+window.preloadArcCollaborators = preloadArcCollaborators;
 /* ========================================
    INITIALISATION ET AUTHENTIFICATION
    ======================================== */
@@ -47,6 +355,7 @@ async function initializeApp() {
     const waitMessage = document.querySelector('.wait');
     const initialProfileId = getInitialProfileUserId();
     const profileOnlyPage = isProfileOnlyPage();
+    const discoverAvailable = hasDiscoverPage();
 
     // Timeout de sécurité : si rien ne se passe après 1 minute
     const safetyTimeout = setTimeout(() => {
@@ -99,7 +408,7 @@ async function initializeApp() {
                 SessionManager.saveSession(user);
             }
             updateNavigation(true);
-            if (!profileOnlyPage) {
+            if (discoverAvailable) {
                 navigateTo('discover');
             }
             await loadAllData();
@@ -117,7 +426,7 @@ async function initializeApp() {
             await loadPublicData();
         }
 
-        if (skipLanding && !profileOnlyPage) {
+        if (skipLanding && discoverAvailable) {
             navigateTo('discover');
         }
         
@@ -395,6 +704,7 @@ function convertSupabaseUser(supabaseUser) {
 }
 
 function convertSupabaseContent(supabaseContent) {
+    const arcOwner = supabaseContent.arcs?.user_id ? getUser(supabaseContent.arcs.user_id) : null;
     return {
         contentId: supabaseContent.id,
         userId: supabaseContent.user_id,
@@ -415,7 +725,10 @@ function convertSupabaseContent(supabaseContent) {
         arc: supabaseContent.arcs ? {
             id: supabaseContent.arcs.id,
             title: supabaseContent.arcs.title,
-            status: supabaseContent.arcs.status
+            status: supabaseContent.arcs.status,
+            ownerId: supabaseContent.arcs.user_id || null,
+            ownerName: arcOwner?.name || null,
+            ownerAvatar: arcOwner?.avatar || null
         } : null,
         project: supabaseContent.projects ? {
             id: supabaseContent.projects.id,
@@ -1712,6 +2025,8 @@ function renderUserCard(userId, isFollowing = false, isEncouraged = false) {
     // Courage Button
     const courageIcon = isEncouraged ? 'icons/courage-green.svg' : 'icons/courage-blue.svg';
     const courageClass = isEncouraged ? 'courage-btn encouraged' : 'courage-btn';
+
+    const collabAvatarsHtml = buildArcCollaboratorAvatars(latestContent, { size: 20, className: 'arc-collab-avatars--card' });
     
     // User Info (Name, Avatar, Subscribe) - Moved to bottom
     const userInfoHtml = `
@@ -1723,6 +2038,7 @@ function renderUserCard(userId, isFollowing = false, isEncouraged = false) {
                     <div style="font-size: 0.7rem; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${user.title || ''}</div>
                 </div>
             </button>
+            ${collabAvatarsHtml}
             ${subscribeBtn}
         </div>
     `;
@@ -1816,11 +2132,11 @@ async function getLiveStreamsForDiscover() {
         const streams = data || [];
         if (streams.length === 0) return [];
 
-        // Filtrer les streams dont l'hôte est encore actif (heartbeat < 30s)
+        // Filtrer les streams dont l'hôte est encore actif (heartbeat < 90s)
         const streamIds = streams.map(s => s.id);
         const hostKeySet = new Set(streams.map(s => `${s.id}:${s.user_id}`));
-        const cutoff = Date.now() - 30000;
-        const recentStartCutoff = Date.now() - 2 * 60 * 1000;
+        const cutoff = Date.now() - 90000;
+        const recentStartCutoff = Date.now() - 10 * 60 * 1000;
 
         const { data: viewerData, error: viewerError } = await supabase
             .from('stream_viewers')
@@ -1829,6 +2145,9 @@ async function getLiveStreamsForDiscover() {
 
         if (viewerError) {
             console.error('Erreur récupération présence host:', viewerError);
+            return streams;
+        }
+        if (!viewerData || viewerData.length === 0) {
             return streams;
         }
 
@@ -1849,7 +2168,7 @@ async function getLiveStreamsForDiscover() {
             if (stream.started_at) {
                 return new Date(stream.started_at).getTime() >= recentStartCutoff;
             }
-            return false;
+            return true;
         });
     } catch (error) {
         console.error('Erreur récupération lives:', error);
@@ -1963,14 +2282,39 @@ async function renderDiscoverGrid() {
     if (!grid) return;
     const waitMessage = document.querySelector('.wait');
     
+    let liveCardsHTML = '';
+    try {
+        const liveStreams = await getLiveStreamsForDiscover();
+        if (liveStreams.length > 0) {
+            liveCardsHTML = liveStreams.map(renderLiveStreamCard).join('');
+        }
+    } catch (error) {
+        console.error('Erreur chargement lives discover:', error);
+    }
+
+    const renderLiveOnly = () => {
+        if (!liveCardsHTML) return false;
+        grid.innerHTML = liveCardsHTML;
+        if (waitMessage) waitMessage.classList.add('is-hidden');
+        if (window.AnimationManager) {
+            setTimeout(() => {
+                AnimationManager.fadeInElements('.user-card', 150);
+            }, 100);
+        }
+        setupDiscoverVideoInteractions();
+        return true;
+    };
+
     // Afficher un état de chargement si les données ne sont pas encore là
     if (!window.hasLoadedUsers) {
+        if (renderLiveOnly()) return;
         if (window.LoadingStateManager && typeof LoadingStateManager.showSpinner === 'function') {
             LoadingStateManager.showSpinner(grid);
         }
         return;
     }
     if (window.userLoadError) {
+        if (renderLiveOnly()) return;
         if (window.LoadingStateManager && typeof LoadingStateManager.showEmptyState === 'function') {
             LoadingStateManager.showEmptyState(
                 grid,
@@ -1991,6 +2335,7 @@ async function renderDiscoverGrid() {
         return;
     }
     if (allUsers.length === 0) {
+        if (renderLiveOnly()) return;
         if (window.LoadingStateManager && typeof LoadingStateManager.showEmptyState === 'function') {
             LoadingStateManager.showEmptyState(
                 grid,
@@ -2014,7 +2359,6 @@ async function renderDiscoverGrid() {
     let usersToDisplay = [...allUsers];
     const currentFilter = window.discoverFilter || 'all';
     let cardsHTML = '';
-    let liveCardsHTML = '';
 
     // Sort users by their latest content date (newest first)
     usersToDisplay.sort((a, b) => {
@@ -2025,10 +2369,12 @@ async function renderDiscoverGrid() {
         return bTime - aTime;
     });
 
-    // Live streams (always on top)
-    const liveStreams = await getLiveStreamsForDiscover();
-    if (liveStreams.length > 0) {
-        liveCardsHTML = liveStreams.map(renderLiveStreamCard).join('');
+    const arcIdsForDiscover = usersToDisplay
+        .map(u => getLatestContent(u.id))
+        .filter(c => c && c.arcId)
+        .map(c => c.arcId);
+    if (arcIdsForDiscover.length > 0) {
+        await preloadArcCollaborators(arcIdsForDiscover);
     }
 
     if (currentUser) {
@@ -2337,6 +2683,11 @@ async function renderImmersiveHeader(user) {
 async function renderImmersiveFeed(contents) {
     let encouragedContentIds = new Set();
     const followMap = new Map();
+
+    const arcIdsForImmersive = (contents || []).filter(c => c && c.arcId).map(c => c.arcId);
+    if (arcIdsForImmersive.length > 0) {
+        await preloadArcCollaborators(arcIdsForImmersive);
+    }
     
     // Fetch user encouragements if logged in
     if (currentUser && contents.length > 0) {
@@ -2392,6 +2743,7 @@ async function renderImmersiveFeed(contents) {
         const isFollowingUser = currentUser ? followMap.get(content.userId) === true : false;
         const followIconSrc = isFollowingUser ? 'icons/subscribed.svg' : 'icons/subscribe.svg';
         const followBtnClass = isFollowingUser ? 'btn-follow-immersive inline unfollow' : 'btn-follow-immersive inline';
+        const collabAvatarsHtml = buildArcCollaboratorAvatars(content, { size: 22, className: 'arc-collab-avatars--immersive' });
 
         let mediaHtml = '';
         if (content.mediaUrl) {
@@ -2445,6 +2797,7 @@ async function renderImmersiveFeed(contents) {
                                 <img src="${contentUserAvatar}" alt="Avatar de ${contentUserName}" class="immersive-post-user-avatar">
                                 <span class="immersive-post-user-name">${contentUserNameHtml}</span>
                             </button>
+                            ${collabAvatarsHtml}
                             ${currentUser && currentUser.id !== content.userId ? `
                                 <button class="${followBtnClass}" data-follow-user="${content.userId}" onclick="event.stopPropagation(); toggleFollow('${currentUser.id}', '${content.userId}')">
                                     <img src="${followIconSrc}" class="btn-icon" style="width: 20px; height: 20px;">
@@ -2937,6 +3290,8 @@ async function renderProfileTimeline(userId) {
     }
     
     console.log('Utilisateur trouvé:', user.name);
+    const currentUserId = window.currentUserId;
+    const isOwnProfile = userId === currentUserId;
     // Récupérer les contenus
     const contents = getUserContentLocal(userId);
     const userBadgesHtml = renderUserBadges(userId);
@@ -2954,26 +3309,112 @@ async function renderProfileTimeline(userId) {
         console.error('Erreur chargement ARCs:', e);
     }
 
+    let collaboratorArcs = [];
+    try {
+        collaboratorArcs = await fetchCollaboratorArcs(userId);
+    } catch (e) {
+        console.error('Erreur chargement ARCs collaboratifs:', e);
+    }
+
+    const arcMap = new Map();
+    userArcs.forEach(arc => {
+        arcMap.set(arc.id, { ...arc, _collabRole: 'owner' });
+    });
+    (collaboratorArcs || []).forEach(arc => {
+        if (!arcMap.has(arc.id)) {
+            arcMap.set(arc.id, { ...arc, _collabRole: 'collaborator' });
+        }
+    });
+    const allArcs = Array.from(arcMap.values());
+
+
     // Filtrer les contenus si un ARC est sélectionné
     let displayContents = contents;
     let selectedArc = null;
     
     if (window.selectedArcId) {
-        displayContents = contents.filter(c => c.arcId === window.selectedArcId);
-        selectedArc = userArcs.find(a => a.id === window.selectedArcId);
+        selectedArc = allArcs.find(a => a.id === window.selectedArcId) || userArcs.find(a => a.id === window.selectedArcId);
+        try {
+            const { data: arcContentsData, error: arcContentsError } = await supabase
+                .from('content')
+                .select(`
+                    *,
+                    arcs (
+                        id,
+                        title,
+                        status,
+                        user_id
+                    ),
+                    projects (
+                        id,
+                        name
+                    )
+                `)
+                .eq('arc_id', window.selectedArcId)
+                .order('created_at', { ascending: false });
+            if (arcContentsError) throw arcContentsError;
+            if (arcContentsData) {
+                const converted = arcContentsData.map(convertSupabaseContent);
+                displayContents = isSuperAdmin() ? converted : converted.filter(c => !c.isDeleted);
+            } else {
+                displayContents = contents.filter(c => c.arcId === window.selectedArcId);
+            }
+        } catch (error) {
+            console.error('Erreur chargement contenus ARC:', error);
+            displayContents = contents.filter(c => c.arcId === window.selectedArcId);
+        }
     }
+
+    const viewerCollabStatusMap = await fetchArcCollabStatusMap(
+        allArcs.map(a => a.id),
+        currentUserId
+    );
+    const pendingRequests = isOwnProfile ? await fetchPendingArcCollabRequests(userId) : [];
 
     // Générer HTML des ARCs
     let arcsHtml = '';
-    if (userArcs.length > 0) {
-        const arcItems = userArcs.map(arc => {
+    if (allArcs.length > 0) {
+        const arcItems = allArcs.map(arc => {
             const isActive = window.selectedArcId === arc.id;
             const progress = 0; // Calculer progression si possible
+            const viewerStatus = viewerCollabStatusMap.get(arc.id);
+            const canCollaborate = currentUserId && currentUserId !== arc.user_id;
+            const collabBadgeHtml = arc._collabRole === 'collaborator'
+                ? `<div style="margin-top:0.35rem; font-size:0.7rem; color: var(--text-secondary);">Collaboration</div>`
+                : '';
+            const ownerLabelHtml = arc._collabRole === 'collaborator' && arc.users?.name
+                ? `<div style="margin-top:0.25rem; font-size:0.7rem; color: var(--text-secondary);">Par ${renderUsernameWithBadge(arc.users.name, arc.users.id || arc.user_id)}</div>`
+                : '';
+            let collabActionHtml = '';
+            if (canCollaborate) {
+                if (viewerStatus === 'pending') {
+                    collabActionHtml = `<div style="margin-top:0.5rem; font-size:0.7rem; color: var(--text-secondary);">Demande envoyée</div>`;
+                } else if (viewerStatus === 'accepted') {
+                    collabActionHtml = `
+                        <div style="margin-top:0.5rem;">
+                            <button onclick="event.stopPropagation(); leaveArcCollaboration('${arc.id}')" style="background: transparent; border: 1px solid #ef4444; color: #ef4444; padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.7rem; cursor: pointer;">
+                                Quitter
+                            </button>
+                        </div>
+                    `;
+                } else {
+                    collabActionHtml = `
+                        <div style="margin-top:0.5rem;">
+                            <button class="btn-collaborate" onclick="event.stopPropagation(); requestArcCollaboration('${arc.id}', '${arc.user_id}')" style="background: rgba(255,255,255,0.06); color: var(--text-primary); padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.7rem; cursor: pointer;">
+                                Collaborer
+                            </button>
+                        </div>
+                    `;
+                }
+            }
             return `
                 <div class="arc-card ${isActive ? 'active' : ''}" onclick="selectArc('${arc.id}', '${userId}')" style="min-width: 200px; padding: 1rem; border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; background: ${isActive ? 'rgba(255,255,255,0.05)' : 'transparent'}; transition: all 0.2s;">
                     <div style="font-weight: 600; margin-bottom: 0.5rem; color: ${isActive ? 'var(--accent-color)' : 'inherit'}">${arc.title}</div>
                     <div style="font-size: 0.8rem; color: var(--text-secondary);">${arc.status === 'completed' ? 'Terminé' : 'En cours'}</div>
+                    ${collabBadgeHtml}
+                    ${ownerLabelHtml}
                     ${isActive ? '<div style="margin-top:0.5rem; font-size:0.75rem; color:var(--accent-color);">Voir les traces</div>' : ''}
+                    ${collabActionHtml}
                 </div>
             `;
         }).join('');
@@ -2991,8 +3432,38 @@ async function renderProfileTimeline(userId) {
         `;
     }
 
-    const currentUserId = window.currentUserId;
-    const isOwnProfile = userId === currentUserId;
+    const collabRequestsHtml = pendingRequests.length > 0 ? `
+        <div class="collab-requests" style="margin: 1.5rem 0; padding: 1rem; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 12px;">
+            <h3 style="margin-bottom: 1rem;">Demandes de collaboration</h3>
+            <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+                ${pendingRequests.map(req => {
+                    const collaborator = req.collaborator;
+                    const arc = req.arc;
+                    const avatar = collaborator?.avatar || 'https://placehold.co/36';
+                    const name = escapeHtml(collaborator?.name || 'Utilisateur');
+                    const arcTitle = escapeHtml(arc?.title || 'ARC');
+                    return `
+                        <div style="display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem; background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px;">
+                            <img src="${avatar}" alt="Avatar ${name}" style="width: 36px; height: 36px; border-radius: 50%; object-fit: cover;">
+                            <div style="flex: 1; min-width: 0;">
+                                <div style="font-weight: 600; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${name}</div>
+                                <div style="font-size: 0.75rem; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Souhaite collaborer sur ${arcTitle}</div>
+                            </div>
+                            <div style="display:flex; gap:0.4rem;">
+                                <button onclick="acceptArcCollaboration('${req.id}', '${req.arcId}', '${req.collaboratorId}')" style="background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.4); color: #10b981; padding: 0.35rem 0.6rem; border-radius: 8px; font-size: 0.75rem; cursor: pointer;">
+                                    Accepter
+                                </button>
+                                <button onclick="declineArcCollaboration('${req.id}', '${req.arcId}')" style="background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.4); color: #ef4444; padding: 0.35rem 0.6rem; border-radius: 8px; font-size: 0.75rem; cursor: pointer;">
+                                    Refuser
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        </div>
+    ` : '';
+
     const isFollowingThisUser = currentUserId && !isOwnProfile ? await isFollowing(currentUserId, userId) : false;
     
     // ... Boutons existants ...
@@ -3059,7 +3530,12 @@ async function renderProfileTimeline(userId) {
         });
     } else if (window.selectedArcId) {
         // ARC sélectionné: afficher TOUT le contenu de l'ARC, trié par jour décroissant
-        const arcItems = [...displayContents].sort((a, b) => getDayNumberValue(b) - getDayNumberValue(a));
+        const uniqueArcUsers = new Set(displayContents.map(c => c.userId).filter(Boolean));
+        const isMultiUserArc = uniqueArcUsers.size > 1;
+        const arcItems = [...displayContents].sort((a, b) => {
+            if (isMultiUserArc) return new Date(b.createdAt) - new Date(a.createdAt);
+            return getDayNumberValue(b) - getDayNumberValue(a);
+        });
         arcItems.forEach(content => {
             timeline.push({
                 dayNumber: getDayNumberValue(content),
@@ -3120,6 +3596,13 @@ async function renderProfileTimeline(userId) {
         } else if (content.state === 'pause') {
             stateBadgeSvg = badgeSVGs.pause;
         }
+
+        let authorHtml = '';
+        if (window.selectedArcId && content.userId && content.userId !== userId) {
+            const author = getUser(content.userId);
+            const authorName = author ? renderUsernameWithBadge(author.name, author.id) : 'Collaborateur';
+            authorHtml = `<div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.25rem;">par ${authorName}</div>`;
+        }
         
         // Ajouter le média s'il existe
         let mediaHtml = '';
@@ -3176,6 +3659,7 @@ async function renderProfileTimeline(userId) {
                 <div class="timeline-date">${dateDisplay}</div>
                 <div class="timeline-card">
                     <h4>${content.title}</h4>
+                    ${authorHtml}
                     <p>${content.description}</p>
                     ${contextHtml}
                     ${mediaHtml}
@@ -3248,6 +3732,13 @@ async function renderProfileTimeline(userId) {
                             contextHtmlLatest = `<div class="timeline-context" style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">${contextItemsLatest.join('')}</div>`;
                         }
 
+                        let authorHtmlLatest = '';
+                        if (window.selectedArcId && content.userId && content.userId !== userId) {
+                            const author = getUser(content.userId);
+                            const authorName = author ? renderUsernameWithBadge(author.name, author.id) : 'Collaborateur';
+                            authorHtmlLatest = `<div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.25rem;">par ${authorName}</div>`;
+                        }
+
                         return `
                             <div class="timeline-dot-badge filled">
                                 ${stateBadgeSvg}
@@ -3255,6 +3746,7 @@ async function renderProfileTimeline(userId) {
                             <div class="timeline-date">${dateDisplay}</div>
                             <div class="timeline-card">
                                 <h4>${content.title}</h4>
+                                ${authorHtmlLatest}
                                 <p>${content.description}</p>
                                 ${contextHtmlLatest}
                                 ${mediaHtmlLatest}
@@ -3345,6 +3837,7 @@ async function renderProfileTimeline(userId) {
             `}
         </div>
         ${arcsHtml}
+        ${collabRequestsHtml}
         ${projectsHtml}
         <div class="profile-analytics-section ${!isOwnProfile ? 'compact' : ''}" style="margin: 2.5rem 0;">
             <h3 class="section-title">Analytics mensuelles</h3>
@@ -3381,7 +3874,18 @@ async function renderProfileIntoContainer(userId) {
     if (!profileContainer) return;
     profileContainer.innerHTML = getProfileLoadingMarkup();
     profileContainer.classList.remove('arc-view');
-    profileContainer.innerHTML = await renderProfileTimeline(userId);
+    try {
+        profileContainer.innerHTML = await renderProfileTimeline(userId);
+    } catch (error) {
+        console.error('Erreur renderProfileTimeline:', error);
+        profileContainer.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-state-icon">⚠️</div>
+                <h3>Impossible de charger le profil</h3>
+                <p>${error?.message || 'Une erreur est survenue pendant le rendu.'}</p>
+            </div>
+        `;
+    }
     profileContainer.classList.toggle('arc-view', !!window.selectedArcId);
     if (window.loadUserArcs) window.loadUserArcs(userId);
     if (window.renderProfileAnalytics) window.renderProfileAnalytics(userId);
@@ -4585,12 +5089,37 @@ async function openCreateMenu(userId, preSelectedArcId = null, existingContent =
     // Get user ARCs for selection
     let arcs = [];
     try {
-        const { data } = await supabase
+        const { data: ownedArcs } = await supabase
             .from('arcs')
-            .select('id, title')
+            .select('id, title, user_id')
             .eq('user_id', userId)
             .eq('status', 'in_progress');
-        arcs = data || [];
+        let collabArcs = [];
+        try {
+            const { data: collabRows } = await supabase
+                .from('arc_collaborations')
+                .select('arc_id')
+                .eq('collaborator_id', userId)
+                .eq('status', 'accepted');
+            const collabArcIds = Array.from(new Set((collabRows || []).map(r => r.arc_id).filter(Boolean)));
+            if (collabArcIds.length > 0) {
+                const { data: collabData } = await supabase
+                    .from('arcs')
+                    .select('id, title, user_id')
+                    .in('id', collabArcIds)
+                    .eq('status', 'in_progress');
+                collabArcs = collabData || [];
+            }
+        } catch (e) {
+            console.error("Error fetching collaborative arcs for create menu", e);
+        }
+
+        const arcMap = new Map();
+        (ownedArcs || []).forEach(arc => arcMap.set(arc.id, { ...arc, _collabRole: 'owner' }));
+        (collabArcs || []).forEach(arc => {
+            if (!arcMap.has(arc.id)) arcMap.set(arc.id, { ...arc, _collabRole: 'collaborator' });
+        });
+        arcs = Array.from(arcMap.values());
     } catch (e) {
         console.error("Error fetching arcs for create menu", e);
     }
@@ -4635,7 +5164,8 @@ async function openCreateMenu(userId, preSelectedArcId = null, existingContent =
     
     arcOptions = arcs.map(a => {
         const selected = (preSelectedArcId && a.id === preSelectedArcId) || (existingContent && (existingContent.arcId === a.id || existingContent.arc_id === a.id)) ? 'selected' : '';
-        return `<option value="${a.id}" ${selected}>${a.title}</option>`;
+        const label = a._collabRole === 'collaborator' ? `${a.title} · collaboration` : a.title;
+        return `<option value="${a.id}" ${selected}>${label}</option>`;
     }).join('');
 
     const isEdit = !!existingContent;

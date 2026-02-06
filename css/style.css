@@ -428,6 +428,31 @@ nav {
     cursor: pointer;
 }
 
+.arc-collab-avatars {
+    display: flex;
+    align-items: center;
+    gap: 0;
+}
+
+.arc-collab-avatars img {
+    border-radius: 999px;
+    border: 2px solid var(--bg-secondary);
+    object-fit: cover;
+    background: #222;
+}
+
+.arc-collab-avatars img + img {
+    margin-left: -8px;
+}
+
+.arc-collab-avatars--card {
+    margin-left: 0.25rem;
+}
+
+.arc-collab-avatars--immersive {
+    margin-left: 0.5rem;
+}
+
 .profile-link {
     display: flex;
     align-items: center;

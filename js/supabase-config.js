@@ -303,7 +303,8 @@ async function getUserContent(userId) {
             arcs (
                 id,
                 title,
-                status
+                status,
+                user_id
             ),
             projects (
                 id,
@@ -330,7 +331,8 @@ async function getUserContentPublic(userId) {
             arcs (
                 id,
                 title,
-                status
+                status,
+                user_id
             )
         `)
         .eq('user_id', userId)
@@ -598,4 +600,3 @@ async function getUserProjects(userId) {
     
     return { success: true, data: data };
 }
-

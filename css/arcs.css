@@ -209,6 +209,11 @@
     border-radius: 2px;
 }
 
+.btn-collaborate {
+    border: 1px solid rgba(255, 255, 255, 0.7);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.15);
+}
+
 .arc-meta {
     display: flex;
     justify-content: space-between;
@@ -291,4 +296,3 @@
 .arc-card-has-cover {
     border: none;
 }
-

@@ -442,13 +442,95 @@ async function loadUserArcs(userId) {
     }
 
     try {
-        const { data: arcs, error } = await supabase
+        const { data: ownedArcs, error } = await supabase
             .from('arcs')
             .select('*')
             .eq('user_id', userId)
             .order('created_at', { ascending: false });
 
         if (error) throw error;
+
+        let collaboratorArcs = [];
+        try {
+            if (typeof window.fetchCollaboratorArcs === 'function') {
+                collaboratorArcs = await window.fetchCollaboratorArcs(userId);
+            } else {
+                const { data: collabRows } = await supabase
+                    .from('arc_collaborations')
+                    .select('arc_id')
+                    .eq('collaborator_id', userId)
+                    .eq('status', 'accepted');
+                const collabArcIds = Array.from(new Set((collabRows || []).map(r => r.arc_id).filter(Boolean)));
+                if (collabArcIds.length > 0) {
+                    const { data: collabArcsData } = await supabase
+                        .from('arcs')
+                        .select('*')
+                        .in('id', collabArcIds)
+                        .order('created_at', { ascending: false });
+                    collaboratorArcs = collabArcsData || [];
+                }
+            }
+        } catch (collabError) {
+            console.error('Error loading collaborative ARCs:', collabError);
+        }
+
+        const arcMap = new Map();
+        (ownedArcs || []).forEach(arc => arcMap.set(arc.id, { ...arc, _collabRole: 'owner' }));
+        (collaboratorArcs || []).forEach(arc => {
+            if (!arcMap.has(arc.id)) {
+                arcMap.set(arc.id, { ...arc, _collabRole: 'collaborator' });
+            }
+        });
+        const arcs = Array.from(arcMap.values());
+
+        let viewerStatusMap = new Map();
+        try {
+            const viewerId = window.currentUser?.id;
+            if (viewerId && arcs.length > 0) {
+                if (typeof window.fetchArcCollabStatusMap === 'function') {
+                    viewerStatusMap = await window.fetchArcCollabStatusMap(arcs.map(a => a.id), viewerId);
+                } else {
+                    const { data: statusRows } = await supabase
+                        .from('arc_collaborations')
+                        .select('arc_id, status')
+                        .eq('collaborator_id', viewerId)
+                        .in('arc_id', arcs.map(a => a.id));
+                    (statusRows || []).forEach(row => {
+                        if (row?.arc_id) viewerStatusMap.set(row.arc_id, row.status);
+                    });
+                }
+            }
+        } catch (statusError) {
+            console.error('Error loading ARC collaboration status:', statusError);
+        }
+
+        let progressMap = new Map();
+        try {
+            const arcIds = arcs.map(a => a.id).filter(Boolean);
+            if (arcIds.length > 0) {
+                const { data: contentRows, error: contentError } = await supabase
+                    .from('content')
+                    .select('arc_id, day_number, is_deleted')
+                    .in('arc_id', arcIds);
+                if (contentError) throw contentError;
+                const isSuper = typeof window.isSuperAdmin === 'function' ? window.isSuperAdmin() : false;
+                const daysByArc = new Map();
+                (contentRows || []).forEach(row => {
+                    if (!row?.arc_id) return;
+                    if (!isSuper && row.is_deleted) return;
+                    const key = row.arc_id;
+                    if (!daysByArc.has(key)) daysByArc.set(key, new Set());
+                    if (row.day_number !== null && row.day_number !== undefined) {
+                        daysByArc.get(key).add(row.day_number);
+                    }
+                });
+                daysByArc.forEach((set, arcId) => {
+                    progressMap.set(arcId, set.size);
+                });
+            }
+        } catch (progressError) {
+            console.error('Error computing ARC progress:', progressError);
+        }
 
         if (arcs && arcs.length > 0) {
             arcsSection.innerHTML = `
@@ -459,7 +541,10 @@ async function loadUserArcs(userId) {
                     ARCs en cours
                 </h3>
                 <div class="arcs-grid">
-                    ${arcs.map(arc => createArcCard(arc)).join('')}
+                    ${arcs.map(arc => {
+                        const progressDays = progressMap.get(arc.id) || 0;
+                        return createArcCard({ ...arc, _progressDays: progressDays }, { viewerStatus: viewerStatusMap.get(arc.id), completedDays: progressDays });
+                    }).join('')}
                 </div>
             `;
         } else {
@@ -471,8 +556,8 @@ async function loadUserArcs(userId) {
     }
 }
 
-function createArcCard(arc) {
-    const progress = calculateArcProgress(arc);
+function createArcCard(arc, options = {}) {
+    const progress = calculateArcProgress(arc, { completedDays: options.completedDays });
     const statusLabels = {
         'in_progress': 'En cours',
         'completed': 'Terminé',
@@ -488,6 +573,34 @@ function createArcCard(arc) {
         overlayClass = 'arc-card-has-cover';
     }
 
+    const viewerId = window.currentUser?.id;
+    const viewerStatus = options.viewerStatus;
+    const canCollaborate = viewerId && viewerId !== arc.user_id;
+    const collabBadgeHtml = arc._collabRole === 'collaborator'
+        ? `<div style="margin-top:0.4rem; font-size:0.75rem; color: var(--text-secondary);">Collaboration</div>`
+        : '';
+    const ownerLabelHtml = arc._collabRole === 'collaborator' && arc.users?.name
+        ? `<div style="margin-top:0.25rem; font-size:0.75rem; color: var(--text-secondary);">Par ${escapeHtml(arc.users.name)}</div>`
+        : '';
+    let collabActionHtml = '';
+    if (canCollaborate) {
+        if (viewerStatus === 'pending') {
+            collabActionHtml = `<div style="margin-top:0.75rem; font-size:0.75rem; color: var(--text-secondary);">Demande envoyée</div>`;
+        } else if (viewerStatus === 'accepted') {
+            collabActionHtml = `
+                <button onclick="event.stopPropagation(); window.leaveArcCollaboration ? window.leaveArcCollaboration('${arc.id}') : alert('Action indisponible');" class="btn btn-ghost" style="margin-top:0.75rem; width:100%; color: var(--failure); border-color: var(--failure);">
+                    Quitter la collaboration
+                </button>
+            `;
+        } else {
+            collabActionHtml = `
+                <button onclick="event.stopPropagation(); window.requestArcCollaboration ? window.requestArcCollaboration('${arc.id}', '${arc.user_id}') : alert('Action indisponible');" class="btn btn-ghost btn-collaborate" style="margin-top:0.75rem; width:100%;">
+                    Collaborer
+                </button>
+            `;
+        }
+    }
+
     return `
         <div class="arc-card ${overlayClass}" onclick="openArcDetails('${arc.id}')" ${styleAttr}>
             <div class="arc-card-overlay"></div>
@@ -497,6 +610,8 @@ function createArcCard(arc) {
                 </div>
                 <h4 class="arc-title" style="text-shadow: 0 2px 4px rgba(0,0,0,0.5);">${escapeHtml(arc.title)}</h4>
                 <p class="arc-goal" style="text-shadow: 0 1px 2px rgba(0,0,0,0.5);">${escapeHtml(arc.goal || '')}</p>
+                ${collabBadgeHtml}
+                ${ownerLabelHtml}
                 
                 <div class="arc-progress-container">
                     <div class="arc-progress-bar" style="background:rgba(255,255,255,0.2);">
@@ -507,6 +622,7 @@ function createArcCard(arc) {
                         <span>${progress}%</span>
                     </div>
                 </div>
+                ${collabActionHtml}
             </div>
         </div>
     `;
@@ -522,10 +638,13 @@ function calculateDaysSince(startDate) {
     return diffDays;
 }
 
-function calculateArcProgress(arc) {
-    if (!arc.duration_days) return 0;
-    const days = calculateDaysSince(arc.start_date);
-    const progress = Math.min(100, Math.round((days / arc.duration_days) * 100));
+function calculateArcProgress(arc, options = {}) {
+    if (!arc || !arc.duration_days) return 0;
+    const completedDays = typeof options.completedDays === 'number'
+        ? options.completedDays
+        : (typeof arc._progressDays === 'number' ? arc._progressDays : 0);
+    const safeCompleted = Math.max(0, completedDays);
+    const progress = Math.min(100, Math.round((safeCompleted / arc.duration_days) * 100));
     return progress;
 }
 
@@ -585,6 +704,11 @@ async function openArcDetails(arcId) {
             .order('created_at', { ascending: false });
 
         if (contentError) throw contentError;
+
+        const progressDaysSet = new Set(
+            (content || []).map(c => c.day_number).filter(v => v !== null && v !== undefined)
+        );
+        arc._progressDays = progressDaysSet.size;
 
         // 5. Render
         renderArcDetails(arc, followersCount, isFollowing, content);
