@@ -1641,7 +1641,7 @@ async function fetchAdminAnnouncements() {
     try {
         const { data, error } = await supabase
             .from("admin_announcements")
-            .select("*")
+            .select("*, users(id, name, avatar)")
             .is("deleted_at", null)
             .order("is_pinned", { ascending: false })
             .order("created_at", { ascending: false })
@@ -1650,10 +1650,12 @@ async function fetchAdminAnnouncements() {
         if (error) throw error;
         window.adminAnnouncements = data || [];
         renderAnnouncements();
+        renderAdminAnnouncementsList();
     } catch (error) {
         console.error("Erreur récupération annonces admin:", error);
         window.adminAnnouncements = [];
         renderAnnouncements();
+        renderAdminAnnouncementsList();
     }
 }
 
@@ -1672,6 +1674,19 @@ function renderAnnouncements() {
         .map((item) => {
             const title = escapeHtml(item.title || "Annonce");
             const body = escapeHtml(item.body || "");
+            const author = item.users || {};
+            const authorId = item.author_id || author.id || SUPER_ADMIN_ID || null;
+            const authorName = escapeHtml(author.name || "Administration");
+            const authorAvatar =
+                author.avatar &&
+                (String(author.avatar).startsWith("http") ||
+                    String(author.avatar).startsWith("data:"))
+                    ? author.avatar
+                    : "https://placehold.co/48";
+            const authorNameHtml =
+                authorId && typeof renderUsernameWithBadge === "function"
+                    ? renderUsernameWithBadge(authorName, authorId)
+                    : authorName;
             const createdAt = item.created_at
                 ? new Date(item.created_at)
                 : null;
@@ -1686,6 +1701,13 @@ function renderAnnouncements() {
                 <div class="announcement-header">
                     <span class="announcement-title">${title}</span>
                     ${item.is_pinned ? '<span class="announcement-pin">Épinglé</span>' : ""}
+                </div>
+                <div class="announcement-author">
+                    <img class="announcement-avatar" src="${authorAvatar}" alt="${authorName}">
+                    <div class="announcement-author-meta">
+                        <div class="announcement-author-name">${authorNameHtml}</div>
+                        <span class="announcement-chip">Annonce officielle</span>
+                    </div>
                 </div>
                 <p class="announcement-body">${body}</p>
                 <div class="announcement-meta">${timeLabel}</div>
@@ -1728,6 +1750,288 @@ async function createAdminAnnouncement(payload) {
         );
         return { success: false, error };
     }
+}
+
+async function updateAdminAnnouncement(payload) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error("Accès refusé", "Vous devez être super-admin.");
+        return { success: false };
+    }
+    const id = String(payload?.id || "").trim();
+    const title = String(payload?.title || "").trim();
+    const body = String(payload?.body || "").trim();
+    const isPinned = !!payload?.isPinned;
+
+    if (!id) {
+        ToastManager?.error("Erreur", "Annonce introuvable.");
+        return { success: false };
+    }
+    if (!title || !body) {
+        ToastManager?.info("Champs requis", "Ajoutez un titre et un contenu.");
+        return { success: false };
+    }
+
+    try {
+        const { error } = await supabase
+            .from("admin_announcements")
+            .update({
+                title,
+                body,
+                is_pinned: isPinned,
+                updated_at: new Date().toISOString(),
+            })
+            .eq("id", id);
+        if (error) throw error;
+        ToastManager?.success("Annonce mise à jour", "Modifications enregistrées.");
+        await fetchAdminAnnouncements();
+        return { success: true };
+    } catch (error) {
+        console.error("Erreur modification annonce:", error);
+        ToastManager?.error(
+            "Erreur",
+            error?.message || "Impossible de modifier l'annonce.",
+        );
+        return { success: false, error };
+    }
+}
+
+async function deleteAdminAnnouncement(announcementId) {
+    if (!isSuperAdmin()) {
+        ToastManager?.error("Accès refusé", "Vous devez être super-admin.");
+        return { success: false };
+    }
+    const id = String(announcementId || "").trim();
+    if (!id) return { success: false };
+    if (!confirm("Supprimer cette annonce officielle ?")) {
+        return { success: false };
+    }
+
+    try {
+        const { error } = await supabase
+            .from("admin_announcements")
+            .update({ deleted_at: new Date().toISOString() })
+            .eq("id", id);
+        if (error) throw error;
+        ToastManager?.success("Annonce supprimée", "Elle n'est plus visible.");
+        await fetchAdminAnnouncements();
+        return { success: true };
+    } catch (error) {
+        console.error("Erreur suppression annonce:", error);
+        ToastManager?.error(
+            "Erreur",
+            error?.message || "Impossible de supprimer l'annonce.",
+        );
+        return { success: false, error };
+    }
+}
+
+function resetAdminAnnouncementForm() {
+    const idInput = document.getElementById("admin-announcement-id");
+    const titleInput = document.getElementById("admin-announcement-title");
+    const bodyInput = document.getElementById("admin-announcement-body");
+    const pinInput = document.getElementById("admin-announcement-pin");
+    const submitBtn = document.getElementById("admin-announcement-submit");
+    const cancelBtn = document.getElementById("admin-announcement-cancel");
+
+    if (idInput) idInput.value = "";
+    if (titleInput) titleInput.value = "";
+    if (bodyInput) bodyInput.value = "";
+    if (pinInput) pinInput.checked = false;
+    if (submitBtn) submitBtn.textContent = "Publier";
+    if (cancelBtn) cancelBtn.style.display = "none";
+}
+
+async function submitAdminAnnouncement() {
+    const idInput = document.getElementById("admin-announcement-id");
+    const titleInput = document.getElementById("admin-announcement-title");
+    const bodyInput = document.getElementById("admin-announcement-body");
+    const pinInput = document.getElementById("admin-announcement-pin");
+    if (!titleInput || !bodyInput || !pinInput) return;
+
+    const id = idInput ? idInput.value : "";
+    const payload = {
+        id,
+        title: titleInput.value,
+        body: bodyInput.value,
+        isPinned: pinInput.checked,
+    };
+    const result = id
+        ? await updateAdminAnnouncement(payload)
+        : await createAdminAnnouncement(payload);
+    if (result?.success) {
+        resetAdminAnnouncementForm();
+    }
+}
+
+function editAdminAnnouncement(announcementId) {
+    if (!isSuperAdmin()) return;
+    const id = String(announcementId || "");
+    const announcements = window.adminAnnouncements || [];
+    const item = announcements.find((a) => String(a.id) === id);
+    if (!item) return;
+
+    const idInput = document.getElementById("admin-announcement-id");
+    const titleInput = document.getElementById("admin-announcement-title");
+    const bodyInput = document.getElementById("admin-announcement-body");
+    const pinInput = document.getElementById("admin-announcement-pin");
+    const submitBtn = document.getElementById("admin-announcement-submit");
+    const cancelBtn = document.getElementById("admin-announcement-cancel");
+
+    if (idInput) idInput.value = id;
+    if (titleInput) titleInput.value = item.title || "";
+    if (bodyInput) bodyInput.value = item.body || "";
+    if (pinInput) pinInput.checked = !!item.is_pinned;
+    if (submitBtn) submitBtn.textContent = "Mettre à jour";
+    if (cancelBtn) cancelBtn.style.display = "inline-flex";
+}
+
+function cancelAdminAnnouncementEdit() {
+    resetAdminAnnouncementForm();
+}
+
+function renderAdminAnnouncementsList() {
+    const container = document.getElementById("admin-announcements-list");
+    if (!container) return;
+    const announcements = window.adminAnnouncements || [];
+    if (announcements.length === 0) {
+        container.innerHTML =
+            '<div class="verification-empty">Aucune annonce officielle.</div>';
+        return;
+    }
+    container.innerHTML = announcements
+        .map((item) => {
+            const title = escapeHtml(item.title || "Annonce");
+            const body = escapeHtml(item.body || "");
+            const safeId = String(item.id || "").replace(/"/g, "&quot;");
+            const createdAt = item.created_at
+                ? new Date(item.created_at)
+                : null;
+            const timeLabel = createdAt
+                ? new Intl.DateTimeFormat("fr-FR", {
+                      day: "numeric",
+                      month: "short",
+                  }).format(createdAt)
+                : "";
+            return `
+            <div class="announcement-card ${item.is_pinned ? "pinned" : ""}">
+                <div class="announcement-header">
+                    <span class="announcement-title">${title}</span>
+                    ${item.is_pinned ? '<span class="announcement-pin">Épinglé</span>' : ""}
+                </div>
+                <p class="announcement-body">${body}</p>
+                <div class="announcement-meta">${timeLabel}</div>
+                <div class="announcement-actions">
+                    <button type="button" class="btn-verify" onclick="editAdminAnnouncement('${safeId}')">Modifier</button>
+                    <button type="button" class="btn-cancel" onclick="deleteAdminAnnouncement('${safeId}')">Supprimer</button>
+                </div>
+            </div>
+        `;
+        })
+        .join("");
+}
+
+function getSuperAdminPanelHtml() {
+    if (!isSuperAdmin()) return "";
+    return `
+        <div class="settings-section">
+            <h3>Super admin</h3>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">Accès total : modération, suppression et annonces officielles.</p>
+
+            <div class="verification-admin-block">
+                <h4>Ban utilisateur (temporaire)</h4>
+                <div class="verification-input-row">
+                    <input type="text" id="admin-ban-user-id" class="form-input" placeholder="ID utilisateur">
+                    <input type="number" id="admin-ban-duration" class="form-input" placeholder="Durée" min="1" value="24">
+                    <select id="admin-ban-unit" class="form-input">
+                        <option value="hours">heures</option>
+                        <option value="days">jours</option>
+                    </select>
+                    <button type="button" class="btn-verify" onclick="
+                        const uid = document.getElementById('admin-ban-user-id').value;
+                        const value = parseInt(document.getElementById('admin-ban-duration').value, 10) || 1;
+                        const unit = document.getElementById('admin-ban-unit').value;
+                        const hours = unit === 'days' ? value * 24 : value;
+                        const reason = document.getElementById('admin-ban-reason').value;
+                        banUserByAdmin(uid, hours, reason);
+                    ">Bannir</button>
+                </div>
+                <div class="verification-input-row">
+                    <input type="text" id="admin-ban-reason" class="form-input" placeholder="Raison (optionnel)">
+                    <button type="button" class="btn-cancel" onclick="
+                        const uid = document.getElementById('admin-ban-user-id').value;
+                        unbanUserByAdmin(uid);
+                    ">Lever le ban</button>
+                    <button type="button" class="btn-cancel" onclick="
+                        const uid = document.getElementById('admin-ban-user-id').value;
+                        hardDeleteUserByAdmin(uid);
+                    ">Supprimer utilisateur</button>
+                </div>
+            </div>
+
+            <div class="verification-admin-block" style="margin-top: 1.5rem;">
+                <h4>Modération contenu</h4>
+                <div class="verification-input-row">
+                    <input type="text" id="admin-content-id" class="form-input" placeholder="ID contenu">
+                    <input type="text" id="admin-content-reason" class="form-input" placeholder="Raison (optionnel)">
+                    <button type="button" class="btn-verify" onclick="
+                        const cid = document.getElementById('admin-content-id').value;
+                        const reason = document.getElementById('admin-content-reason').value;
+                        softDeleteContentByAdmin(cid, reason);
+                    ">Masquer</button>
+                </div>
+                <div class="verification-input-row">
+                    <button type="button" class="btn-cancel" onclick="
+                        const cid = document.getElementById('admin-content-id').value;
+                        restoreContentByAdmin(cid);
+                    ">Restaurer</button>
+                    <button type="button" class="btn-cancel" onclick="
+                        const cid = document.getElementById('admin-content-id').value;
+                        hardDeleteContentByAdmin(cid);
+                    ">Supprimer définitivement</button>
+                </div>
+            </div>
+
+            <div class="verification-admin-block" style="margin-top: 1.5rem;">
+                <h4>Annonce officielle</h4>
+                <div class="verification-input-row" style="flex-direction: column; align-items: stretch;">
+                    <input type="hidden" id="admin-announcement-id">
+                    <input type="text" id="admin-announcement-title" class="form-input" placeholder="Titre de l'annonce">
+                    <textarea id="admin-announcement-body" class="form-input" rows="3" placeholder="Contenu de l'annonce"></textarea>
+                    <label style="display:flex; align-items:center; gap:0.5rem; color: var(--text-secondary); font-size: 0.9rem;">
+                        <input type="checkbox" id="admin-announcement-pin"> Épingler
+                    </label>
+                    <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap: wrap;">
+                        <button type="button" class="btn-verify" id="admin-announcement-submit" onclick="submitAdminAnnouncement()">Publier</button>
+                        <button type="button" class="btn-cancel" id="admin-announcement-cancel" onclick="cancelAdminAnnouncementEdit()" style="display:none;">Annuler modification</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="verification-admin-block" style="margin-top: 1.5rem;">
+                <h4>Gérer les annonces</h4>
+                <div id="admin-announcements-list"></div>
+            </div>
+        </div>
+    `;
+}
+
+function renderSuperAdminPage() {
+    const container = document.getElementById("admin-dashboard");
+    if (!container) return;
+    container.innerHTML = `
+        <div class="settings-section">
+            <div class="settings-header" style="border:none; margin-bottom:1rem; padding-bottom:0;">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap: 1rem; flex-wrap: wrap;">
+                    <div style="display:flex; align-items:center; gap: 0.75rem;">
+                        <h2>Administration</h2>
+                        <span class="admin-badge">Super admin</span>
+                    </div>
+                </div>
+                <p>Gestion complète du compte et des annonces officielles.</p>
+            </div>
+        </div>
+        ${getSuperAdminPanelHtml()}
+    `;
 }
 
 async function fetchVerificationRequests() {
@@ -4450,6 +4754,16 @@ async function renderProfileTimeline(userId) {
             <div class="badge-icon"><img src="icons/analytics.svg" alt="Analytics" style="width:100%;height:100%;"></div>
             <span>Analytics</span>
         </button>
+        ${
+            isSuperAdmin()
+                ? `
+        <button class="badge settings-badge" onclick="window.location.href='admin.html'" title="Administration">
+            <div class="badge-icon"><img src="icons/team.svg" alt="Administration" style="width:100%;height:100%;"></div>
+            <span>Admin</span>
+        </button>
+        `
+                : ""
+        }
         <button class="badge settings-badge" onclick="openSettings('${userId}')" title="Réglages">
             <div class="badge-icon"><img src="icons/reglages.svg" alt="Réglages" style="width:100%;height:100%;"></div>
             <span>Réglages</span>
@@ -4463,23 +4777,46 @@ async function renderProfileTimeline(userId) {
         </button>
     `;
 
-    const followButtonHtml =
-        !isOwnProfile && currentUserId
-            ? `
-        <button 
-            class="btn btn-follow ${isFollowingThisUser ? "unfollow" : ""}"
-            onclick="toggleFollow('${currentUserId}', '${userId}')"
-            id="follow-btn-${userId}"
-            style="background: transparent; border: none; padding: 0;"
-        >
-            <img src="${isFollowingThisUser ? "icons/subscribed.svg" : "icons/subscribe.svg"}" class="btn-icon" style="width: 24px; height: 24px;">
-        </button>
-    `
-            : "";
+    let followButtonHtml = "";
+    if (!isOwnProfile && currentUserId) {
+        const isCommunity = user.account_subtype === 'community' || user.accountSubtype === 'community';
+        if (isCommunity) {
+             followButtonHtml = `
+                <button 
+                    class="btn btn-community-join"
+                    onclick="toggleFollow('${currentUserId}', '${userId}')"
+                    id="follow-btn-${userId}"
+                    style="padding: 0.5rem 1.2rem; border-radius: 99px; font-weight: 600; font-size: 0.9rem; color: ${isFollowingThisUser ? "var(--text-primary)" : "var(--bg-color)"}; background: ${isFollowingThisUser ? "rgba(255,255,255,0.1)" : "var(--text-primary)"}; border: 1px solid ${isFollowingThisUser ? "var(--border-color)" : "transparent"};"
+                >
+                    ${isFollowingThisUser ? "Membre" : "Rejoindre"}
+                </button>
+            `;
+        } else {
+            followButtonHtml = `
+                <button 
+                    class="btn btn-follow ${isFollowingThisUser ? "unfollow" : ""}"
+                    onclick="toggleFollow('${currentUserId}', '${userId}')"
+                    id="follow-btn-${userId}"
+                    style="background: transparent; border: none; padding: 0;"
+                >
+                    <img src="${isFollowingThisUser ? "icons/subscribed.svg" : "icons/subscribe.svg"}" class="btn-icon" style="width: 24px; height: 24px;">
+                </button>
+            `;
+        }
+    }
 
     const followerCount = await getFollowerCount(userId);
     const followingCount = await getFollowingCount(userId);
     const engagementTotals = await getUserEngagementTotals(userId);
+    const accountTypeValue = String(user.account_type || "").toLowerCase();
+    const accountSubtypeValue = String(user.account_subtype || user.accountSubtype || "").toLowerCase();
+    const isCommunityAccount =
+        accountSubtypeValue === "community" ||
+        accountSubtypeValue === "enterprise" ||
+        accountSubtypeValue === "company" ||
+        accountTypeValue === "community" ||
+        accountTypeValue === "enterprise" ||
+        accountTypeValue === "company";
     const engagementStatsHtml = `
         <div class="follow-section" style="margin-top: 0.5rem;">
             <div class="follower-stat">
@@ -4490,10 +4827,16 @@ async function renderProfileTimeline(userId) {
                 <div class="follower-stat-count">${engagementTotals.totalEncouragements}</div>
                 <div class="follower-stat-label">Encouragements reçus</div>
             </div>
+            ${
+                isCommunityAccount
+                    ? ""
+                    : `
             <div class="follower-stat">
                 <div class="follower-stat-count">${engagementTotals.totalStreamViewers}</div>
                 <div class="follower-stat-label">Viewers de streams</div>
             </div>
+            `
+            }
         </div>
     `;
 
@@ -4946,6 +5289,14 @@ async function renderProfileIntoContainer(userId) {
     profileContainer.classList.remove("arc-view");
     try {
         profileContainer.innerHTML = await renderProfileTimeline(userId);
+        
+        // Community Account Visuals
+        const user = getUser(userId);
+        if (user && (user.account_subtype === 'community' || user.accountSubtype === 'community')) {
+            profileContainer.classList.add('is-community');
+        } else {
+            profileContainer.classList.remove('is-community');
+        }
     } catch (error) {
         console.error("Erreur renderProfileTimeline:", error);
         profileContainer.innerHTML = `
@@ -5332,88 +5683,7 @@ async function openSettings(userId) {
     `
         : "";
 
-    const superAdminHtml = isSuperAdmin()
-        ? `
-        <div class="settings-section">
-            <h3>Super admin</h3>
-            <p style="color: var(--text-secondary); margin-bottom: 1rem;">Accès total : modération, suppression et annonces officielles.</p>
-
-            <div class="verification-admin-block">
-                <h4>Ban utilisateur (temporaire)</h4>
-                <div class="verification-input-row">
-                    <input type="text" id="admin-ban-user-id" class="form-input" placeholder="ID utilisateur">
-                    <input type="number" id="admin-ban-duration" class="form-input" placeholder="Durée" min="1" value="24">
-                    <select id="admin-ban-unit" class="form-input">
-                        <option value="hours">heures</option>
-                        <option value="days">jours</option>
-                    </select>
-                    <button type="button" class="btn-verify" onclick="
-                        const uid = document.getElementById('admin-ban-user-id').value;
-                        const value = parseInt(document.getElementById('admin-ban-duration').value, 10) || 1;
-                        const unit = document.getElementById('admin-ban-unit').value;
-                        const hours = unit === 'days' ? value * 24 : value;
-                        const reason = document.getElementById('admin-ban-reason').value;
-                        banUserByAdmin(uid, hours, reason);
-                    ">Bannir</button>
-                </div>
-                <div class="verification-input-row">
-                    <input type="text" id="admin-ban-reason" class="form-input" placeholder="Raison (optionnel)">
-                    <button type="button" class="btn-cancel" onclick="
-                        const uid = document.getElementById('admin-ban-user-id').value;
-                        unbanUserByAdmin(uid);
-                    ">Lever le ban</button>
-                    <button type="button" class="btn-cancel" onclick="
-                        const uid = document.getElementById('admin-ban-user-id').value;
-                        hardDeleteUserByAdmin(uid);
-                    ">Supprimer utilisateur</button>
-                </div>
-            </div>
-
-            <div class="verification-admin-block" style="margin-top: 1.5rem;">
-                <h4>Modération contenu</h4>
-                <div class="verification-input-row">
-                    <input type="text" id="admin-content-id" class="form-input" placeholder="ID contenu">
-                    <input type="text" id="admin-content-reason" class="form-input" placeholder="Raison (optionnel)">
-                    <button type="button" class="btn-verify" onclick="
-                        const cid = document.getElementById('admin-content-id').value;
-                        const reason = document.getElementById('admin-content-reason').value;
-                        softDeleteContentByAdmin(cid, reason);
-                    ">Masquer</button>
-                </div>
-                <div class="verification-input-row">
-                    <button type="button" class="btn-cancel" onclick="
-                        const cid = document.getElementById('admin-content-id').value;
-                        restoreContentByAdmin(cid);
-                    ">Restaurer</button>
-                    <button type="button" class="btn-cancel" onclick="
-                        const cid = document.getElementById('admin-content-id').value;
-                        hardDeleteContentByAdmin(cid);
-                    ">Supprimer définitivement</button>
-                </div>
-            </div>
-
-            <div class="verification-admin-block" style="margin-top: 1.5rem;">
-                <h4>Annonce officielle</h4>
-                <div class="verification-input-row" style="flex-direction: column; align-items: stretch;">
-                    <input type="text" id="admin-announcement-title" class="form-input" placeholder="Titre de l'annonce">
-                    <textarea id="admin-announcement-body" class="form-input" rows="3" placeholder="Contenu de l'annonce"></textarea>
-                    <label style="display:flex; align-items:center; gap:0.5rem; color: var(--text-secondary); font-size: 0.9rem;">
-                        <input type="checkbox" id="admin-announcement-pin"> Épingler
-                    </label>
-                    <button type="button" class="btn-verify" onclick="
-                        const title = document.getElementById('admin-announcement-title').value;
-                        const body = document.getElementById('admin-announcement-body').value;
-                        const pin = document.getElementById('admin-announcement-pin').checked;
-                        createAdminAnnouncement({ title, body, isPinned: pin });
-                        document.getElementById('admin-announcement-title').value = '';
-                        document.getElementById('admin-announcement-body').value = '';
-                        document.getElementById('admin-announcement-pin').checked = false;
-                    ">Publier</button>
-                </div>
-            </div>
-        </div>
-    `
-        : "";
+    const superAdminHtml = "";
 
     // Social links preparation
     const socialLinks = user.social_links || user.socialLinks || {};
@@ -5587,7 +5857,6 @@ async function openSettings(userId) {
                 </div>
             </form>
             ${verificationAdminHtml}
-            ${superAdminHtml}
         </div>
     `;
 
@@ -6991,6 +7260,13 @@ window.addVerifiedUserId = addVerifiedUserId;
 window.handleVerificationSelection = handleVerificationSelection;
 window.isSuperAdmin = isSuperAdmin;
 window.createAdminAnnouncement = createAdminAnnouncement;
+window.updateAdminAnnouncement = updateAdminAnnouncement;
+window.deleteAdminAnnouncement = deleteAdminAnnouncement;
+window.submitAdminAnnouncement = submitAdminAnnouncement;
+window.editAdminAnnouncement = editAdminAnnouncement;
+window.cancelAdminAnnouncementEdit = cancelAdminAnnouncementEdit;
+window.renderSuperAdminPage = renderSuperAdminPage;
+window.fetchAdminAnnouncements = fetchAdminAnnouncements;
 window.banUserByAdmin = banUserByAdmin;
 window.unbanUserByAdmin = unbanUserByAdmin;
 window.softDeleteContentByAdmin = softDeleteContentByAdmin;

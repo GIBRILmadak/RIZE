@@ -165,10 +165,44 @@ body {
     line-height: 1.5;
 }
 
+.announcement-author {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.6rem;
+}
+
+.announcement-avatar {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 1px solid rgba(255,255,255,0.1);
+}
+
+.announcement-author-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.announcement-author-name {
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
 .announcement-meta {
     margin-top: 0.75rem;
     font-size: 0.75rem;
     color: var(--text-secondary);
+}
+
+.announcement-actions {
+    display: flex;
+    gap: 0.6rem;
+    margin-top: 0.75rem;
+    flex-wrap: wrap;
 }
 
 /* --- NAVIGATION --- */
@@ -2211,6 +2245,14 @@ input[type="text"]:focus, input[type="url"]:focus, textarea:focus, .form-input:f
     overflow-y: auto;
 }
 
+.admin-page {
+    max-width: 900px;
+    margin: 7rem auto 3rem;
+    max-height: none;
+    overflow: visible;
+    padding: 2.5rem 1.5rem;
+}
+
 @keyframes fadeInSettings {
     from { opacity: 0; transform: translateY(20px); }
     to { opacity: 1; transform: translateY(0); }
@@ -3204,4 +3246,31 @@ html.light-mode .btn-theme-toggle:hover {
     width: 40px;
     height: 40px;
     border-width: 4px;
+}
+
+/* --- COMMUNITY PROFILE ENHANCEMENTS --- */
+.profile-container.is-community .profile-banner {
+    height: 250px;
+    border-radius: 24px;
+    object-fit: cover;
+}
+
+@media (min-width: 768px) {
+    .profile-container.is-community .profile-banner {
+        height: 350px;
+    }
+}
+
+.profile-container.is-community .profile-avatar-img {
+    border-radius: 20px;
+    box-shadow: 0 0 0 4px var(--bg-color);
+}
+
+.profile-container.is-community .btn-community-join {
+    transition: all 0.2s ease;
+}
+
+.profile-container.is-community .btn-community-join:hover {
+    transform: scale(1.05);
+    opacity: 0.9;
 }
